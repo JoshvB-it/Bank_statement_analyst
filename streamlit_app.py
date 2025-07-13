@@ -40,7 +40,6 @@ if uploaded_files:
             st.error(f"Unsupported file format: {file.name}")
             continue
 
-        # Minimal column validation
         if "Date" in df.columns:
             df['Date'] = pd.to_datetime(df['Date'], dayfirst=True, errors='coerce')
 
@@ -61,7 +60,6 @@ if uploaded_files:
     st.subheader("📄 All Transactions")
     st.dataframe(all_data)
 
-    # Excel Export
     @st.cache_data
     def convert_df_to_excel(df):
         return df.to_excel(index=False, engine='openpyxl')
