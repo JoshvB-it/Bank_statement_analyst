@@ -1,20 +1,32 @@
-import pdfplumber
+import re
 import pandas as pd
+import pdfplumber
 
-def parse_fnb_pdf(file):
-    rows = []
-    with pdfplumber.open(file) as pdf:
+def parse_fnb_pdf(pdf_file):
+    transactions = []
+
+    with pdfplumber.open(pdf_file) as pdf:
         for page in pdf.pages:
-            table = page.extract_table()
-            if table:
-                for row in table[1:]:  # Skip header
-                    if len(row) >= 3 and all(row[:3]):
-                        date, desc, amount = row[:3]
-                        rows.append([date.strip(), desc.strip(), amount.strip()])
+            text = page.extract_text()
+            if not text:
+                continue
+            lines = text.split("\n")
+            for line in lines:
+                # Match date at start and amount at end, optionally with 'C' for credit
+                match = re.match(r"^(\d{2}[A-Za-z]{3})\s+(.*?)(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)(C?)$", line.strip())
+                if match:
+                    date = match.group(1)
+                    desc = match.group(2).strip()
+                    amount = match.group(3).replace(",", "")
+                    is_credit = match.group(4) == "C"
 
-    df = pd.DataFrame(rows, columns=["Date", "Description", "Amount"])
-    df["Date"] = pd.to_datetime(df["Date"], dayfirst=True, errors="coerce")
-    df["Amount"] = df["Amount"].str.replace("R", "", regex=False).str.replace(",", "").str.replace(" ", "")
-    df["Amount"] = pd.to_numeric(df["Amount"], errors="coerce")
-    df.dropna(subset=["Date", "Amount"], inplace=True)
+                    try:
+                        amount = float(amount)
+                        if is_credit:
+                            amount = -amount
+                        transactions.append([date, desc, amount])
+                    except:
+                        pass
+
+    df = pd.DataFrame(transactions, columns=["Date", "Description", "Amount"])
     return df
