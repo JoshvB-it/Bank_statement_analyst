@@ -2,46 +2,48 @@ import streamlit as st
 import pandas as pd
 from io import BytesIO
 from parse_pdf import parse_fnb_pdf
-from classify import classify_transactions
+from classify import classify_transaction
 
-st.set_page_config(page_title="Bank Statement Analyst", layout="centered")
+# --- PASSWORD PROTECTION ---
+PASSWORD = "Poen@enMilo131!"
+if "authenticated" not in st.session_state:
+    st.session_state["authenticated"] = False
 
+if not st.session_state["authenticated"]:
+    password = st.text_input("Enter password to continue", type="password")
+    if password == PASSWORD:
+        st.session_state["authenticated"] = True
+        st.experimental_rerun()
+    else:
+        st.stop()
+
+# --- STREAMLIT UI ---
 st.title("📄 Bank Statement Analyst")
-st.markdown("Upload your **FNB PDF bank statements** to auto-classify transactions.")
+st.caption("Upload your FNB PDF bank statements for auto-classification.")
 
-uploaded_files = st.file_uploader("Upload PDF files", type="pdf", accept_multiple_files=True)
+uploaded_files = st.file_uploader("Upload PDF files", type=["pdf"], accept_multiple_files=True)
 
-def convert_df_to_excel(df):
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-        df.to_excel(writer, index=False, sheet_name='Transactions')
-    return output.getvalue()
+# --- PROCESS FILES ---
+all_data = pd.DataFrame()
 
 if uploaded_files:
-    all_data = []
-    for uploaded_file in uploaded_files:
-        st.write(f"🔍 Processing: {uploaded_file.name}")
-        try:
-            df = parse_fnb_pdf(uploaded_file)
-            if df is not None and not df.empty:
-                df_classified = classify_transactions(df)
-                all_data.append(df_classified)
-            else:
-                st.warning(f"No data found in {uploaded_file.name}")
-        except Exception as e:
-            st.error(f"Error processing {uploaded_file.name}: {e}")
+    for file in uploaded_files:
+        df = parse_fnb_pdf(file)
+        df["Category"] = df["Description"].apply(classify_transaction)
+        all_data = pd.concat([all_data, df], ignore_index=True)
 
-    if all_data:
-        final_df = pd.concat(all_data, ignore_index=True)
+    if not all_data.empty:
         st.success("✅ Parsed and classified successfully.")
-        st.dataframe(final_df)
+        st.dataframe(all_data)
 
-        excel_data = convert_df_to_excel(final_df)
-        st.download_button(
-            label="⬇️ Download Excel",
-            data=excel_data,
-            file_name="classified_transactions.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+        # --- EXCEL EXPORT ---
+        def convert_df_to_excel(df):
+            output = BytesIO()
+            with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+                df.to_excel(writer, index=False, sheet_name="Transactions")
+            return output.getvalue()
+
+        excel_data = convert_df_to_excel(all_data)
+        st.download_button("📥 Download Excel", data=excel_data, file_name="classified_transactions.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     else:
-        st.error("No transactions could be parsed from the uploaded PDFs.")
+        st.error("No transactions parsed. Please check the PDF format.")
