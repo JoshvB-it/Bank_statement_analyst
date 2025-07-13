@@ -4,32 +4,44 @@ from io import BytesIO
 from parse_pdf import parse_fnb_pdf
 from classify import classify_transactions
 
-st.set_page_config(page_title="Bank Statement Classifier", layout="centered")
+st.set_page_config(page_title="Bank Statement Analyst", layout="centered")
 
-st.title("📄 FNB Bank Statement Analyzer")
-st.write("Upload your **FNB bank statements (PDFs)** and get auto-classified income and expenses.")
+st.title("📄 Bank Statement Analyst")
+st.markdown("Upload your **FNB PDF bank statements** to auto-classify transactions.")
 
-uploaded_files = st.file_uploader("Upload PDFs", type="pdf", accept_multiple_files=True)
+uploaded_files = st.file_uploader("Upload PDF files", type="pdf", accept_multiple_files=True)
 
 def convert_df_to_excel(df):
     output = BytesIO()
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-        df.to_excel(writer, index=False, sheet_name="Classified")
-        writer.save()
+        df.to_excel(writer, index=False, sheet_name='Transactions')
     return output.getvalue()
 
 if uploaded_files:
-    all_data = pd.DataFrame()
-    for file in uploaded_files:
-        df = parse_fnb_pdf(file)
-        df = classify_transactions(df)
-        all_data = pd.concat([all_data, df], ignore_index=True)
+    all_data = []
+    for uploaded_file in uploaded_files:
+        st.write(f"🔍 Processing: {uploaded_file.name}")
+        try:
+            df = parse_fnb_pdf(uploaded_file)
+            if df is not None and not df.empty:
+                df_classified = classify_transactions(df)
+                all_data.append(df_classified)
+            else:
+                st.warning(f"No data found in {uploaded_file.name}")
+        except Exception as e:
+            st.error(f"Error processing {uploaded_file.name}: {e}")
 
-    if not all_data.empty:
+    if all_data:
+        final_df = pd.concat(all_data, ignore_index=True)
         st.success("✅ Parsed and classified successfully.")
-        st.dataframe(all_data)
+        st.dataframe(final_df)
 
-        excel_data = convert_df_to_excel(all_data)
-        st.download_button("📥 Download Excel", excel_data, file_name="classified_fnb.xlsx")
+        excel_data = convert_df_to_excel(final_df)
+        st.download_button(
+            label="⬇️ Download Excel",
+            data=excel_data,
+            file_name="classified_transactions.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
     else:
-        st.error("No transactions detected. Check if the PDFs are FNB format.")
+        st.error("No transactions could be parsed from the uploaded PDFs.")
