@@ -53,7 +53,6 @@ def classify_transaction(desc):
 
 
 # --- EXPORT TO EXCEL ---
-@st.cache_data
 def convert_df_to_excel(df):
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
