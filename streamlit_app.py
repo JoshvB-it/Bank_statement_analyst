@@ -1,49 +1,67 @@
 import streamlit as st
 import pandas as pd
-from io import BytesIO
-from parse_pdf import parse_fnb_pdf
+from parse_pdf import extract_transactions_from_pdf
 from classify import classify_transaction
+from config import APP_PASSWORD
 
-# --- PASSWORD PROTECTION ---
-PASSWORD = "Poen@enMilo131!"
+# --- PASSWORD ---
 if "authenticated" not in st.session_state:
-    st.session_state["authenticated"] = False
+    st.session_state.authenticated = False
 
-if not st.session_state["authenticated"]:
-    password = st.text_input("Enter password to continue", type="password")
-    if password == PASSWORD:
-        st.session_state["authenticated"] = True
-        st.experimental_rerun()
+if not st.session_state.authenticated:
+    pwd = st.text_input("Enter password", type="password")
+    if pwd == APP_PASSWORD:
+        st.session_state.authenticated = True
     else:
         st.stop()
 
-# --- STREAMLIT UI ---
-st.title("📄 Bank Statement Analyst")
-st.caption("Upload your FNB PDF bank statements for auto-classification.")
-
-uploaded_files = st.file_uploader("Upload PDF files", type=["pdf"], accept_multiple_files=True)
-
-# --- PROCESS FILES ---
-all_data = pd.DataFrame()
+# --- FILE UPLOAD ---
+st.title("📊 Personal Bank Statement Analyzer")
+uploaded_files = st.file_uploader("Upload your monthly FNB bank statement PDFs", type="pdf", accept_multiple_files=True)
 
 if uploaded_files:
-    for file in uploaded_files:
-        df = parse_fnb_pdf(file)
+    all_data = pd.DataFrame()
+
+    for pdf in uploaded_files:
+        df = extract_transactions_from_pdf(pdf)
         df["Category"] = df["Description"].apply(classify_transaction)
-        all_data = pd.concat([all_data, df], ignore_index=True)
+        all_data = pd.concat([all_data, df])
 
-    if not all_data.empty:
-        st.success("✅ Parsed and classified successfully.")
-        st.dataframe(all_data)
+    # Add Budget Comparison
+    budget = {
+        "Airtime": 300,
+        "Electricity": 600,
+        "Fixed Expenses": 10000,
+        "Food": 6000,
+        "Transport": 4000,
+        "Income - Salary": 0,
+        "Income - Interest": 0,
+        "Other": 2000
+    }
 
-        # --- EXCEL EXPORT ---
-        def convert_df_to_excel(df):
-            output = BytesIO()
-            with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-                df.to_excel(writer, index=False, sheet_name="Transactions")
-            return output.getvalue()
+    summary = all_data.groupby("Category")["Amount"].sum().reset_index()
+    summary["Budget"] = summary["Category"].map(budget)
+    summary["Variance"] = summary["Budget"] - summary["Amount"]
 
-        excel_data = convert_df_to_excel(all_data)
-        st.download_button("📥 Download Excel", data=excel_data, file_name="classified_transactions.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    else:
-        st.error("No transactions parsed. Please check the PDF format.")
+    st.success("✅ Parsed and classified successfully.")
+    st.subheader("💡 Year-to-Date Summary vs Budget")
+    st.dataframe(summary)
+
+    st.subheader("📄 Full Transaction History")
+    st.dataframe(all_data)
+
+    # Download
+    @st.cache_data
+    def convert_df_to_excel(df1, df2):
+        from io import BytesIO
+        output = BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            df1.to_excel(writer, index=False, sheet_name="Transactions")
+            df2.to_excel(writer, index=False, sheet_name="Summary")
+        return output.getvalue()
+
+    excel_file = convert_df_to_excel(all_data, summary)
+    st.download_button("📥 Download Excel", excel_file, file_name="classified_transactions.xlsx")
+
+else:
+    st.info("👆 Upload one or more monthly FNB PDFs to begin.")
