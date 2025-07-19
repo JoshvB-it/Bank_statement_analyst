@@ -1,5 +1,5 @@
 # Password for app access
-PASSWORD = "josuavanbuuren@gmail.com"
+PASSWORD = "Poen@enMilo131!"
 
 # Monthly budget per category
 BUDGET = {
