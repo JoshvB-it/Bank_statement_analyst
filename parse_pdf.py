@@ -15,20 +15,20 @@ def parse_fnb_text_to_dataframe(text):
     lines = text.splitlines()
     transactions = []
 
-    pattern = re.compile(r"^\d{2} [A-Z][a-z]{2} \d{2} ")
+    # Updated: Match lines with proper date + description + amount
+    transaction_pattern = re.compile(r'^(\d{2} [A-Za-z]{3}) (.+?) (\d{1,3}(?:,\d{3})*(?:\.\d{2})?)(Cr)?$')
 
     for line in lines:
-        if pattern.match(line):
-            parts = line.strip().split()
-            if len(parts) >= 5:
-                date = " ".join(parts[:3])
-                amount_str = parts[-1].replace(",", "")
-                try:
-                    amount = float(amount_str)
-                except ValueError:
-                    continue
-                description = " ".join(parts[3:-1])
-                transactions.append((date, description, amount))
+        line = line.strip()
+        match = transaction_pattern.match(line)
+        if match:
+            date = match.group(1)
+            description = match.group(2).strip()
+            amount_str = match.group(3).replace(",", "")
+            amount = float(amount_str)
+            is_credit = match.group(4) == "Cr"
+            amount = amount if not is_credit else -amount  # Flip sign if Cr
+            transactions.append((date, description, -amount))  # Make expenses negative
 
     df = pd.DataFrame(transactions, columns=["Date", "Description", "Amount"])
     return df
