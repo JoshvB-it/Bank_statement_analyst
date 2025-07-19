@@ -2,10 +2,10 @@ import streamlit as st
 import pandas as pd
 from io import BytesIO
 from parse_pdf import parse_fnb_pdf
-from classify import classify_df
-from config import PASSWORD, BUDGET
+from classify import classify_transactions
 
-# Password Gate
+# --- Password protection ---
+PASSWORD = "secure123"  # change this
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
 
@@ -13,48 +13,48 @@ if not st.session_state.authenticated:
     password = st.text_input("Enter password", type="password")
     if password == PASSWORD:
         st.session_state.authenticated = True
-        st.experimental_rerun()
+        st.rerun()
     else:
         st.stop()
 
-# Streamlit UI
-st.title("🔒 FNB Statement Analyzer")
+# --- Upload ---
+st.title("📄 Bank Statement Analyzer")
+st.write("Upload your monthly FNB bank statements (PDF only).")
 
-uploaded_files = st.file_uploader("📤 Upload your FNB bank statements (PDF)", type="pdf", accept_multiple_files=True)
+uploaded_files = st.file_uploader("Upload PDF(s)", type="pdf", accept_multiple_files=True)
 
 if uploaded_files:
     all_data = []
+
     for file in uploaded_files:
-        df = parse_fnb_pdf(file)
-        df = classify_df(df)
+        text = parse_fnb_pdf(file)
+        df = classify_transactions(text)
+        df["Source"] = file.name
         all_data.append(df)
 
-    if all_data:
-        df_all = pd.concat(all_data, ignore_index=True)
-        df_all["Date"] = pd.to_datetime(df_all["Date"] + " 2024", format="%d %b %Y", errors="coerce")
-        df_all.dropna(subset=["Date"], inplace=True)
+    final_df = pd.concat(all_data, ignore_index=True)
 
-        ytd_summary = df_all.groupby("Category")["Amount"].sum().reset_index()
+    # --- Budget and YTD summary ---
+    st.header("📊 Dashboard")
+    total_expense = final_df[final_df["Type"] == "Expense"]["Amount"].sum()
+    total_income = final_df[final_df["Type"] == "Income"]["Amount"].sum()
 
-        st.subheader("📅 Year-to-Date Summary")
-        st.dataframe(ytd_summary)
+    col1, col2 = st.columns(2)
+    col1.metric("💰 Total Income YTD", f"R {total_income:,.2f}")
+    col2.metric("📉 Total Expenses YTD", f"R {total_expense:,.2f}")
 
-        st.subheader("📊 Budget Comparison")
-        budget_df = pd.DataFrame(BUDGET.items(), columns=["Category", "Budget"])
-        comparison = pd.merge(budget_df, ytd_summary, on="Category", how="left").fillna(0)
-        comparison["Variance"] = comparison["Budget"] - comparison["Amount"]
-        st.dataframe(comparison)
+    st.subheader("Classified Transactions")
+    st.dataframe(final_df)
 
-        st.bar_chart(comparison.set_index("Category")[["Amount", "Budget"]])
+    # --- Download Excel ---
+    def convert_df(df):
+        output = BytesIO()
+        with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+            df.to_excel(writer, index=False)
+        return output.getvalue()
 
-        st.subheader("📥 Download Transactions")
-        def convert_df(df):
-            output = BytesIO()
-            with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-                df.to_excel(writer, index=False)
-            return output.getvalue()
+    excel_data = convert_df(final_df)
+    st.download_button("📥 Download Excel", excel_data, file_name="transactions.xlsx")
 
-        st.download_button("Download Excel", data=convert_df(df_all), file_name="transactions.xlsx")
-
-    else:
-        st.error("❌ No data parsed from PDFs.")
+else:
+    st.info("Please upload at least one PDF file.")
