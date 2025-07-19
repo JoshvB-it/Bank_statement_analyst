@@ -1,11 +1,12 @@
 import streamlit as st
 import pandas as pd
-from io import BytesIO
-from parse_pdf import parse_fnb_pdf
+from parse_pdf import parse_bank_statement
 from classify import classify_transactions
+from config import PASSWORD, BUDGET
 
-# --- Password protection ---
-PASSWORD = "secure123"  # change this
+st.set_page_config(page_title="Private Personal Finance", layout="centered")
+
+# Password protection
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
 
@@ -17,44 +18,40 @@ if not st.session_state.authenticated:
     else:
         st.stop()
 
-# --- Upload ---
-st.title("📄 Bank Statement Analyzer")
-st.write("Upload your monthly FNB bank statements (PDF only).")
-
-uploaded_files = st.file_uploader("Upload PDF(s)", type="pdf", accept_multiple_files=True)
+# Main app
+st.title("📊 Private Personal Finance Dashboard")
+uploaded_files = st.file_uploader("Upload your FNB PDF bank statements", type="pdf", accept_multiple_files=True)
 
 if uploaded_files:
     all_data = []
+    for pdf in uploaded_files:
+        df = parse_bank_statement(pdf)
+        if not df.empty:
+            df = classify_transactions(df)
+            all_data.append(df)
 
-    for file in uploaded_files:
-        text = parse_fnb_pdf(file)
-        df = classify_transactions(text)
-        df["Source"] = file.name
-        all_data.append(df)
+    if all_data:
+        df_all = pd.concat(all_data).sort_values(by="Date")
+        df_all["Month"] = pd.to_datetime(df_all["Date"]).dt.to_period("M")
 
-    final_df = pd.concat(all_data, ignore_index=True)
+        # Monthly + YTD summary
+        monthly_summary = df_all.groupby(["Month", "Category"])["Amount"].sum().unstack(fill_value=0)
+        ytd_summary = df_all.groupby("Category")["Amount"].sum()
 
-    # --- Budget and YTD summary ---
-    st.header("📊 Dashboard")
-    total_expense = final_df[final_df["Type"] == "Expense"]["Amount"].sum()
-    total_income = final_df[final_df["Type"] == "Income"]["Amount"].sum()
+        # Budget comparison
+        budget_df = pd.DataFrame.from_dict(BUDGET, orient="index", columns=["Budget"])
+        budget_df["Actual YTD"] = ytd_summary
+        budget_df["Variance"] = budget_df["Budget"] - budget_df["Actual YTD"]
 
-    col1, col2 = st.columns(2)
-    col1.metric("💰 Total Income YTD", f"R {total_income:,.2f}")
-    col2.metric("📉 Total Expenses YTD", f"R {total_expense:,.2f}")
+        # Show summaries
+        st.subheader("📅 Monthly Summary")
+        st.dataframe(monthly_summary.style.format("R{:,.2f}"))
 
-    st.subheader("Classified Transactions")
-    st.dataframe(final_df)
+        st.subheader("📆 Year-to-Date Summary vs Budget")
+        st.dataframe(budget_df.style.format("R{:,.2f}"))
 
-    # --- Download Excel ---
-    def convert_df(df):
-        output = BytesIO()
-        with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-            df.to_excel(writer, index=False)
-        return output.getvalue()
+        # Download
+        st.download_button("⬇️ Download Full Transactions", df_all.to_csv(index=False), file_name="transactions.csv")
 
-    excel_data = convert_df(final_df)
-    st.download_button("📥 Download Excel", excel_data, file_name="transactions.xlsx")
-
-else:
-    st.info("Please upload at least one PDF file.")
+    else:
+        st.error("No transactions parsed from PDFs.")
