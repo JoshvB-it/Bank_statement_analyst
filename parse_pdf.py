@@ -1,24 +1,24 @@
-import PyPDF2
-import re
+import fitz  # PyMuPDF
 import pandas as pd
+import re
 
-def extract_transactions_from_pdf(pdf_file):
-    reader = PyPDF2.PdfReader(pdf_file)
-    text = ''
-    for page in reader.pages:
-        text += page.extract_text()
+def parse_fnb_pdf(file):
+    text = ""
+    with fitz.open(stream=file.read(), filetype="pdf") as doc:
+        for page in doc:
+            text += page.get_text()
 
-    lines = text.split('\n')
+    lines = text.split("\n")
     transactions = []
     for line in lines:
-        match = re.match(r"(\d{2}\s\w{3})\s+(.*?)\s+(-?\d+\.\d{2})\s+(\d+\.\d{2})", line)
+        match = re.match(r"(\d{2}\s\w{3})\s+(.*?)(\d{1,3}(?:,\d{3})*\.\d{2})\s+(CR)?", line)
         if match:
-            date, description, amount, balance = match.groups()
-            transactions.append({
-                "Date": date,
-                "Description": description.strip(),
-                "Amount": float(amount),
-                "Balance": float(balance)
-            })
+            date = match.group(1)
+            description = match.group(2).strip()
+            amount = float(match.group(3).replace(",", ""))
+            is_credit = match.group(4) == "CR"
+            amount = amount if is_credit else -amount
+            transactions.append((date, description, amount))
 
-    return pd.DataFrame(transactions)
+    df = pd.DataFrame(transactions, columns=["Date", "Description", "Amount"])
+    return df
