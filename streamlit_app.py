@@ -1,67 +1,60 @@
 import streamlit as st
 import pandas as pd
-from parse_pdf import extract_transactions_from_pdf
-from classify import classify_transaction
-from config import APP_PASSWORD
+from io import BytesIO
+from parse_pdf import parse_fnb_pdf
+from classify import classify_df
+from config import PASSWORD, BUDGET
 
-# --- PASSWORD ---
+# Password Gate
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
 
 if not st.session_state.authenticated:
-    pwd = st.text_input("Enter password", type="password")
-    if pwd == APP_PASSWORD:
+    password = st.text_input("Enter password", type="password")
+    if password == PASSWORD:
         st.session_state.authenticated = True
+        st.experimental_rerun()
     else:
         st.stop()
 
-# --- FILE UPLOAD ---
-st.title("📊 Personal Bank Statement Analyzer")
-uploaded_files = st.file_uploader("Upload your monthly FNB bank statement PDFs", type="pdf", accept_multiple_files=True)
+# Streamlit UI
+st.title("🔒 FNB Statement Analyzer")
+
+uploaded_files = st.file_uploader("📤 Upload your FNB bank statements (PDF)", type="pdf", accept_multiple_files=True)
 
 if uploaded_files:
-    all_data = pd.DataFrame()
+    all_data = []
+    for file in uploaded_files:
+        df = parse_fnb_pdf(file)
+        df = classify_df(df)
+        all_data.append(df)
 
-    for pdf in uploaded_files:
-        df = extract_transactions_from_pdf(pdf)
-        df["Category"] = df["Description"].apply(classify_transaction)
-        all_data = pd.concat([all_data, df])
+    if all_data:
+        df_all = pd.concat(all_data, ignore_index=True)
+        df_all["Date"] = pd.to_datetime(df_all["Date"] + " 2024", format="%d %b %Y", errors="coerce")
+        df_all.dropna(subset=["Date"], inplace=True)
 
-    # Add Budget Comparison
-    budget = {
-        "Airtime": 300,
-        "Electricity": 600,
-        "Fixed Expenses": 10000,
-        "Food": 6000,
-        "Transport": 4000,
-        "Income - Salary": 0,
-        "Income - Interest": 0,
-        "Other": 2000
-    }
+        ytd_summary = df_all.groupby("Category")["Amount"].sum().reset_index()
 
-    summary = all_data.groupby("Category")["Amount"].sum().reset_index()
-    summary["Budget"] = summary["Category"].map(budget)
-    summary["Variance"] = summary["Budget"] - summary["Amount"]
+        st.subheader("📅 Year-to-Date Summary")
+        st.dataframe(ytd_summary)
 
-    st.success("✅ Parsed and classified successfully.")
-    st.subheader("💡 Year-to-Date Summary vs Budget")
-    st.dataframe(summary)
+        st.subheader("📊 Budget Comparison")
+        budget_df = pd.DataFrame(BUDGET.items(), columns=["Category", "Budget"])
+        comparison = pd.merge(budget_df, ytd_summary, on="Category", how="left").fillna(0)
+        comparison["Variance"] = comparison["Budget"] - comparison["Amount"]
+        st.dataframe(comparison)
 
-    st.subheader("📄 Full Transaction History")
-    st.dataframe(all_data)
+        st.bar_chart(comparison.set_index("Category")[["Amount", "Budget"]])
 
-    # Download
-    @st.cache_data
-    def convert_df_to_excel(df1, df2):
-        from io import BytesIO
-        output = BytesIO()
-        with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            df1.to_excel(writer, index=False, sheet_name="Transactions")
-            df2.to_excel(writer, index=False, sheet_name="Summary")
-        return output.getvalue()
+        st.subheader("📥 Download Transactions")
+        def convert_df(df):
+            output = BytesIO()
+            with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+                df.to_excel(writer, index=False)
+            return output.getvalue()
 
-    excel_file = convert_df_to_excel(all_data, summary)
-    st.download_button("📥 Download Excel", excel_file, file_name="classified_transactions.xlsx")
+        st.download_button("Download Excel", data=convert_df(df_all), file_name="transactions.xlsx")
 
-else:
-    st.info("👆 Upload one or more monthly FNB PDFs to begin.")
+    else:
+        st.error("❌ No data parsed from PDFs.")
