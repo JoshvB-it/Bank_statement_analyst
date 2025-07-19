@@ -1,11 +1,12 @@
 import pytesseract
-from pdf2image import convert_from_path
+from pdf2image import convert_from_bytes
 import re
 import pandas as pd
 from datetime import datetime
 
 def parse_bank_statement(file):
-    images = convert_from_path(file, dpi=300)
+    file_bytes = file.read()
+    images = convert_from_bytes(file_bytes, dpi=300)
     all_text = ""
 
     for image in images:
