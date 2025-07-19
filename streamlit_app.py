@@ -1,19 +1,13 @@
-# streamlit_app.py
-
 import streamlit as st
 import pandas as pd
-from io import BytesIO
-from config import PASSWORD
 from parse_pdf import parse_bank_statement
-from classify import classify_dataframe
+from classify import classify_transaction
+from config import PASSWORD, BUDGET
 
-st.set_page_config(page_title="Private Finance App", layout="wide")
+st.set_page_config(page_title="Personal Finance Dashboard", layout="wide")
 
-# 🔒 Password gate
+# Password protection
 if "authenticated" not in st.session_state:
-    st.session_state.authenticated = False
-
-if not st.session_state.authenticated:
     password = st.text_input("Enter password", type="password")
     if password == PASSWORD:
         st.session_state.authenticated = True
@@ -21,39 +15,44 @@ if not st.session_state.authenticated:
     else:
         st.stop()
 
-# ✅ Main app starts here
-st.title("📊 Personal Finance Dashboard")
+# File upload
+st.title("📄 Upload Bank Statements")
+uploaded_files = st.file_uploader("Browse files", type="pdf", accept_multiple_files=True)
 
-uploaded_files = st.file_uploader("Upload PDF bank statements", type="pdf", accept_multiple_files=True)
+all_data = []
 
 if uploaded_files:
-    all_data = []
-
-    for file in uploaded_files:
-        try:
-            df = parse_bank_statement(file)
-            df = classify_dataframe(df)
-            all_data.append(df)
-        except Exception as e:
-            st.error(f"❌ Error processing {file.name}: {e}")
+    for uploaded_file in uploaded_files:
+        transactions = parse_bank_statement(uploaded_file)
+        for tx in transactions:
+            tx["Category"] = classify_transaction(tx["Description"])
+        all_data.extend(transactions)
 
     if all_data:
-        combined_df = pd.concat(all_data, ignore_index=True)
+        df = pd.DataFrame(all_data)
+        df["Date"] = pd.to_datetime(df["Date"])
+        df["Month"] = df["Date"].dt.strftime("%Y-%m")
+        df["Amount"] = df["Amount"].astype(float)
 
         st.subheader("🧾 Transactions")
-        st.dataframe(combined_df)
+        st.dataframe(df[["Date", "Description", "Amount", "Category"]])
 
-        # 📊 Budget summary
+        # Year-to-Date summary
         st.subheader("📈 Year-to-Date Summary by Category")
-        summary = combined_df.groupby("Category")["Amount"].sum().reset_index()
-        st.bar_chart(summary.set_index("Category"))
+        ytd_summary = df.groupby("Category")["Amount"].sum().reset_index()
+        st.dataframe(ytd_summary)
 
-        # 📥 Download Excel
-        output = BytesIO()
-        with pd.ExcelWriter(output, engine="openpyxl") as writer:
-            combined_df.to_excel(writer, index=False, sheet_name="Transactions")
-            summary.to_excel(writer, index=False, sheet_name="Summary")
-        st.download_button("📥 Download Excel", output.getvalue(), "Finance_Report.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        # Budget comparison
+        st.subheader("💰 Budget Comparison")
+        budget_df = pd.DataFrame.from_dict(BUDGET, orient="index", columns=["Budget"])
+        budget_df.index.name = "Category"
+        comparison = budget_df.join(ytd_summary.set_index("Category"), how="left").fillna(0)
+        comparison.rename(columns={"Amount": "Actual"}, inplace=True)
+        comparison["Variance"] = comparison["Budget"] - comparison["Actual"]
+        st.dataframe(comparison)
 
-else:
-    st.info("Upload your FNB bank statements to begin.")
+        # Export
+        st.download_button("📥 Download Excel", data=df.to_csv(index=False), file_name="transactions.csv")
+
+    else:
+        st.warning("No transactions found in uploaded statements.")
