@@ -1,21 +1,24 @@
-def classify_transaction(description):
+def classify_transaction(description, amount):
     desc = description.lower()
-    if "salary" in desc or "deposit" in desc:
+    if "salary" in desc or "income" in desc:
         return "Income"
-    if "rent" in desc:
+    elif "rent" in desc:
         return "Rent"
-    if "checkers" in desc or "woolworths" in desc or "food" in desc:
-        return "Food"
-    if "petrol" in desc or "garage" in desc:
+    elif "petrol" in desc or "fuel" in desc:
         return "Petrol"
-    if "wifi" in desc or "internet" in desc:
+    elif "food" in desc or "restaurant" in desc or "grocery" in desc:
+        return "Food"
+    elif "wifi" in desc or "internet" in desc:
         return "WiFi"
-    if "medical" in desc or "hospital" in desc:
+    elif "medical" in desc or "aid" in desc:
         return "Medical Aid"
-    if "insurance" in desc:
+    elif "insurance" in desc:
         return "Insurance"
-    if "electricity" in desc or "prepaid" in desc:
+    elif "electricity" in desc or "prepaid" in desc:
         return "Utilities"
-    if "airtime" in desc or "cell" in desc:
+    elif "airtime" in desc or "mobile" in desc:
         return "Phones"
-    return "Other"
+    elif amount > 0:
+        return "Income"
+    else:
+        return "Miscellaneous"
