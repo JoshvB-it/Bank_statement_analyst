@@ -1,19 +1,17 @@
-# config.py
+# Password for app access
+PASSWORD = "josuavanbuuren@gmail.com"
 
-# Password to access app
-PASSWORD = "Poen@enMilo131!"
-
-# Categories to classify transactions into
-CATEGORIES = {
-    "Rent": ["RENT"],
-    "Utilities": ["MUNICIPAL", "UTILITIES", "WATER", "ELECTRICITY"],
-    "WiFi": ["TELKOM", "VODACOM", "MTN", "RAIN", "AFRIBOOM", "INTERNET"],
-    "Food": ["SPAR", "WOOLWORTHS", "PICK N PAY", "CHECKERS", "FOOD"],
-    "Petrol": ["ENGEN", "SHELL", "BP", "SASOL", "TOTAL", "FUEL", "GARAGE"],
-    "Medical Aid": ["DISCOVERY", "MEDICAL", "HOSPITAL", "PHARMACY"],
-    "Income": ["SALARY", "INCOME", "TRANSFER FROM"],
-    "Airtime": ["AIRTIME", "RECHARGE"],
-    "Electricity": ["ELECTRICITY"],
-    "Insurance": ["INSURANCE", "OUTSURANCE", "CAR INSURANCE"],
-    "Other": []
+# Monthly budget per category
+BUDGET = {
+    "Rent": 8000,
+    "Utilities": 1000,
+    "WiFi": 600,
+    "Phones": 800,
+    "Petrol": 4000,
+    "Food": 6000,
+    "Misc": 1000,
+    "Insurance": 3000,
+    "Medical Aid": 7000,
+    "Income": 0,
+    "Other": 2000,
 }
