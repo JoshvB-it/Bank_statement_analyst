@@ -58,6 +58,13 @@ DEFAULT_PASSWORD = "changeme"
 # to the given category.  You can extend or modify this dictionary to
 # better match your own spending habits.
 CATEGORY_KEYWORDS = {
+    # Income is handled first.  These keywords identify genuine income
+    # credits rather than internal transfers.  Any credit that does
+    # not match these keywords will be classified as a "Transfer" by
+    # the classification logic below.
+    "Income": [
+        "pwc", "krans", "stefani"
+    ],
     "Groceries": [
         "woolworths", "cc fresh", "fresh x", "pick n pay", "spar",
         "checkers", "food lovers", "pnp", "spaza", "fruit and veg"
@@ -73,7 +80,7 @@ CATEGORY_KEYWORDS = {
     "Food & Drink": [
         "bk ", "kfc", "mcd", "roco", "spur", "king pie", "mochachos",
         "milky lane", "salsa", "mama", "restaurant", "coffee", "diner",
-        "pizza", "steers", "galitos", "burger", "chips", "dlocal *microsoft x",  # digital services fall here by default
+        "pizza", "steers", "galitos", "burger", "chips", "dlocal *microsoft x"
     ],
     "Fuel & Transport": [
         "engen", "sasol", "bp", "caltex", "shell", "petrol", "diesel",
@@ -89,10 +96,6 @@ CATEGORY_KEYWORDS = {
         "laerskool", "school", "tuition", "netcash", "scholar",
         "fees", "uniform", "books"
     ],
-    "Transfers & Income": [
-        "transfer", "payment", "salary", "credit", "magtape credit",
-        "fnb app transfer", "received", "cr netcash"
-    ],
     "Bank Charges & Fees": [
         "byc debit", "service fee", "bank charge", "interest",
         "facility fee", "admin fee"
@@ -101,12 +104,7 @@ CATEGORY_KEYWORDS = {
 
 
 def get_statement_year(path: str) -> Optional[int]:
-    """Extract the statement year from the first page of the PDF.
-
-    Bank statements list a "Statement Date" on the first page (e.g.
-    "Statement Date : 14 May 2025").  We parse the year from this line.
-    Returns None if no year can be determined.
-    """
+    """Extract the statement year from the first page of the PDF."""
     try:
         doc = fitz.open(path)
     except Exception:
@@ -116,19 +114,12 @@ def get_statement_year(path: str) -> Optional[int]:
         m = re.search(r"Statement Date\s*:\s*\d{1,2} [A-Za-z]+ (\d{4})", text)
         if m:
             return int(m.group(1))
-        # only check the first page
         break
     return None
 
 
 def parse_transactions(path: str) -> List[Tuple[datetime, str, float]]:
-    """Parse all transactions from a PDF statement.
-
-    Each transaction is returned as a tuple of (date, description,
-    amount).  Debits (spending) are positive numbers and credits
-    (income or transfers into the account) are negative numbers.  The
-    parser handles multiple formats found in FNB bank statements.
-    """
+    """Parse all transactions from a PDF statement."""
     year = get_statement_year(path) or datetime.now().year
     transactions: List[Tuple[datetime, str, float]] = []
     date_pattern = r"^(\d{1,2})\s+([A-Za-z]{3})(?:\s+(.+))?$"
@@ -149,14 +140,12 @@ def parse_transactions(path: str) -> List[Tuple[datetime, str, float]]:
                 amount: Optional[float] = None
                 search_start = i + 1
                 if remainder:
-                    # date and description on the same line
                     desc = remainder.strip()
                     search_start = i + 1
                 else:
                     # separate date; determine description or immediate amount
                     if i + 1 < len(lines):
                         next_line = lines[i + 1].strip()
-                        # is next line a number? if so then description is blank
                         mnum = re.match(number_pattern, next_line)
                         if mnum:
                             desc = ""
@@ -165,13 +154,11 @@ def parse_transactions(path: str) -> List[Tuple[datetime, str, float]]:
                             if suffix and suffix.lower().startswith("cr"):
                                 num = -num
                             amount = num
-                            i = i + 1  # skip over amount line
+                            i = i + 1
                             search_start = i + 1
                         else:
-                            # otherwise treat next line as description
                             desc = next_line
                             search_start = i + 2
-                # if amount has not been set, search for it in subsequent lines
                 if amount is None:
                     for j in range(search_start, min(search_start + 6, len(lines))):
                         cand = lines[j].strip()
@@ -193,59 +180,108 @@ def parse_transactions(path: str) -> List[Tuple[datetime, str, float]]:
     return transactions
 
 
-def classify_transaction(description: str) -> str:
-    """Classify a transaction into a high‑level spending category.
+def parse_balances(path: str) -> Tuple[Optional[float], Optional[float]]:
+    """Extract the opening and closing balances from a statement."""
+    opening = None
+    closing = None
+    try:
+        doc = fitz.open(path)
+    except Exception:
+        return (opening, closing)
+    pattern = re.compile(r"(Opening|Closing) Balance\s+([\d,]+\.\d{2})\s*(Cr|Dr)?", re.IGNORECASE)
+    for page in doc:
+        text = page.get_text()
+        for match in pattern.finditer(text):
+            label, num_str, suffix = match.groups()
+            amount = float(num_str.replace(",", ""))
+            if suffix and suffix.lower().startswith("dr"):
+                amount = -amount
+            if label.lower().startswith("opening"):
+                opening = amount
+            elif label.lower().startswith("closing"):
+                closing = amount
+        if opening is not None and closing is not None:
+            break
+    return (opening, closing)
 
-    The function looks for the presence of any keyword from the
-    ``CATEGORY_KEYWORDS`` mapping in the lowercase description.  The
-    first matching category is returned.  If no keywords match the
-    description, the transaction is assigned to the "Other" category.
-    """
+
+def classify_transaction(description: str, amount: float) -> str:
+    """Classify a transaction into a high‑level category."""
     desc_lower = description.lower() if description else ""
+    if amount < 0:
+        for keyword in CATEGORY_KEYWORDS.get("Income", []):
+            if keyword in desc_lower:
+                return "Income"
+        return "Transfers"
     for category, keywords in CATEGORY_KEYWORDS.items():
+        if category == "Income":
+            continue
         for keyword in keywords:
             if keyword in desc_lower:
                 return category
-    # identify credits/income explicitly: descriptions with common
-    # transfer or credit keywords but not matched above fall here
-    if any(k in desc_lower for k in ["cr ", "credit", "transfer", "salary"]):
-        return "Transfers & Income"
     return "Other"
 
 
-def load_transactions_from_files(files: List) -> pd.DataFrame:
-    """Load and combine transactions from multiple uploaded PDF files.
-
-    Returns a DataFrame with columns: Date, Description, Amount,
-    Category, Month, Year.  Dates that cannot be parsed will be
-    represented as NaT.
-    """
-    all_txns: List[Tuple[datetime, str, float]] = []
+def load_transactions_from_files(files: List) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Load and combine transactions from multiple uploaded PDF files."""
+    all_txns: List[Tuple[str, datetime, str, float]] = []
+    balance_rows: List[Tuple[str, Optional[float], float, float, Optional[float], Optional[float]]] = []
     for uploaded_file in files:
-        # Capture the raw bytes from the uploaded file
         data = uploaded_file.getvalue()
         tmp_path = f"/tmp/{uploaded_file.name}"
         with open(tmp_path, "wb") as tmpf:
             tmpf.write(data)
         txns = parse_transactions(tmp_path)
-        all_txns.extend(txns)
-    df = pd.DataFrame(all_txns, columns=["Date", "Description", "Amount"])
-    if df.empty:
-        return df
-    df["Category"] = df["Description"].apply(classify_transaction)
-    df["Year"] = df["Date"].dt.year
-    df["Month"] = df["Date"].dt.strftime("%b")
-    return df
+        opening, closing = parse_balances(tmp_path)
+        for (dt, desc, amt) in txns:
+            all_txns.append((uploaded_file.name, dt, desc, amt))
+        total_transactions = sum(amt for _, _, amt in txns)
+        expected_closing = None
+        diff = None
+        if opening is not None:
+            expected_closing = opening + total_transactions
+            if closing is not None:
+                diff = closing - expected_closing
+        balance_rows.append((
+            uploaded_file.name,
+            opening,
+            total_transactions,
+            expected_closing,
+            closing,
+            diff
+        ))
+    tx_df = pd.DataFrame(all_txns, columns=["Statement", "Date", "Description", "Amount"])
+    if tx_df.empty:
+        return tx_df, pd.DataFrame(balance_rows, columns=[
+            "Statement", "Opening Balance", "Sum of Transactions",
+            "Expected Closing", "Actual Closing", "Difference"
+        ])
+    tx_df["Category"] = tx_df.apply(lambda row: classify_transaction(row["Description"], row["Amount"]), axis=1)
+    tx_df["Year"] = tx_df["Date"].dt.year
+    tx_df["Month"] = tx_df["Date"].dt.strftime("%b")
+    balance_df = pd.DataFrame(balance_rows, columns=[
+        "Statement", "Opening Balance", "Sum of Transactions",
+        "Expected Closing", "Actual Closing", "Difference"
+    ])
+    return tx_df, balance_df
 
 
-def show_dashboard(df: pd.DataFrame) -> None:
-    """Render interactive dashboard elements based on the transaction DataFrame."""
+def show_dashboard(tx_df: pd.DataFrame, balance_df: pd.DataFrame) -> None:
+    """Render interactive dashboard elements based on the transaction and balance DataFrames."""
+    st.subheader("Balance Check per Statement")
+    if not balance_df.empty:
+        formatted = balance_df.copy()
+        for col in ["Opening Balance", "Sum of Transactions", "Expected Closing", "Actual Closing", "Difference"]:
+            formatted[col] = formatted[col].apply(lambda x: f"{x:,.2f}" if pd.notnull(x) else "")
+        st.dataframe(formatted)
+    else:
+        st.info("No balance data available.")
+
     st.subheader("Summary of Spending and Income")
-    summary = df.groupby("Category")["Amount"].sum().reset_index()
+    summary = tx_df.groupby("Category")["Amount"].sum().reset_index()
     summary = summary.sort_values("Amount", ascending=False)
     st.dataframe(summary.rename(columns={"Amount": "Total (ZAR)"}))
 
-    # Bar chart for spending categories (expenses > 0)
     spend_df = summary[summary["Amount"] > 0]
     if not spend_df.empty:
         chart = alt.Chart(spend_df).mark_bar().encode(
@@ -258,10 +294,9 @@ def show_dashboard(df: pd.DataFrame) -> None:
         )
         st.altair_chart(chart, use_container_width=True)
 
-    # Year‑to‑date totals
     st.subheader("Year‑to‑Date Totals")
     current_year = datetime.now().year
-    ytd_df = df[df["Year"] == current_year]
+    ytd_df = tx_df[tx_df["Year"] == current_year]
     if not ytd_df.empty:
         ytd_summary = ytd_df.groupby("Category")["Amount"].sum().reset_index()
         ytd_summary = ytd_summary.sort_values("Amount", ascending=False)
@@ -269,11 +304,10 @@ def show_dashboard(df: pd.DataFrame) -> None:
     else:
         st.info("No transactions found for the current year.")
 
-    # Monthly totals
     st.subheader("Monthly Spending/Income")
-    monthly = df.copy()
+    monthly = tx_df.copy()
     monthly["Month-Year"] = monthly["Date"].dt.to_period("M").astype(str)
-    monthly_summary = monthly.groupby(["Month-Year"])["Amount"].sum().reset_index()
+    monthly_summary = monthly.groupby(["Month-Year"])["Amount"].sum().reset_index().sort_values("Month-Year")
     monthly_summary["Spend"] = monthly_summary["Amount"].apply(lambda x: x if x > 0 else 0)
     monthly_summary["Income"] = monthly_summary["Amount"].apply(lambda x: -x if x < 0 else 0)
     melted = monthly_summary.melt(id_vars=["Month-Year"], value_vars=["Spend", "Income"],
@@ -286,9 +320,40 @@ def show_dashboard(df: pd.DataFrame) -> None:
     ).properties(width=600, height=300, title="Monthly Spend vs Income")
     st.altair_chart(chart2, use_container_width=True)
 
-    # Display raw transactions
+    st.subheader("Export Monthly Classification with YTD Totals")
+    export_df = build_export_dataframe(tx_df)
+    csv_data = export_df.to_csv(index=False).encode('utf-8')
+    st.download_button(
+        label="Download monthly breakdown (CSV)",
+        data=csv_data,
+        file_name="monthly_breakdown.csv",
+        mime="text/csv"
+    )
+
     st.subheader("Transactions")
-    st.dataframe(df.sort_values("Date"))
+    st.dataframe(tx_df.sort_values(["Date", "Statement"]))
+
+
+def build_export_dataframe(tx_df: pd.DataFrame) -> pd.DataFrame:
+    """Build a DataFrame suitable for export showing monthly breakdown and rolling YTD totals."""
+    if tx_df.empty:
+        return pd.DataFrame(columns=["Month-Year", "Category", "Amount", "YTD Total"])
+    df = tx_df.copy()
+    df["Month-Year"] = df["Date"].dt.to_period("M").astype(str)
+    grouped = df.groupby(["Month-Year", "Category"])["Amount"].sum().reset_index()
+    grouped["Month_Order"] = pd.to_datetime(grouped["Month-Year"] + "-01")
+    def category_order(cat: str) -> Tuple[int, str]:
+        if cat == "Income":
+            return (0, cat)
+        if cat == "Transfers":
+            return (1, cat)
+        return (2, cat)
+    grouped["Cat_Order"] = grouped["Category"].apply(category_order)
+    grouped = grouped.sort_values(["Month_Order", "Cat_Order"])
+    grouped["YTD Total"] = grouped["Amount"].cumsum()
+    grouped = grouped.drop(columns=["Month_Order", "Cat_Order"])
+    grouped = grouped[["Month-Year", "Category", "Amount", "YTD Total"]]
+    return grouped
 
 
 def require_login() -> bool:
@@ -314,7 +379,6 @@ def main() -> None:
     """Main entry point for the Streamlit app."""
     st.set_page_config(page_title="FNB Statement Analysis", layout="wide")
     st.title("FNB Bank Statement Analysis")
-    # Enforce login
     if not require_login():
         st.stop()
     st.write(
@@ -326,11 +390,11 @@ def main() -> None:
     )
     if uploaded_files:
         try:
-            df = load_transactions_from_files(uploaded_files)
-            if df.empty:
+            tx_df, balance_df = load_transactions_from_files(uploaded_files)
+            if tx_df.empty:
                 st.warning("No transactions were found in the uploaded files.")
             else:
-                show_dashboard(df)
+                show_dashboard(tx_df, balance_df)
         except Exception as e:
             st.error(f"An error occurred while processing your files: {e}")
     else:
