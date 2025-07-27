@@ -52,12 +52,12 @@ CATEGORY_KEYWORDS = {
 
 def get_statement_year(path: str) -> Optional[int]:
     """
-    Reads the first page looking for 'Statement Date : DD MMM YYYY' to extract year.
+    Reads the first page looking for 'Statement Date : DD MMM YYYY' to extract the year.
     """
     try:
         doc = fitz.open(path)
         for page in doc:
-            text = page.get_text()
+            text = page.get_text("text")
             m = re.search(r"Statement Date\s*:\s*\d{1,2} [A-Za-z]+ (\d{4})", text)
             if m:
                 return int(m.group(1))
@@ -69,69 +69,100 @@ def get_statement_year(path: str) -> Optional[int]:
 
 def parse_transactions(path: str) -> List[Tuple[datetime, str, float]]:
     """
-    Token-based parsing: splits each line into words, finds the first
-    numeric token (the transaction amount), and treats everything before
-    it (after date & month) as the description.
+    Robust, two-pass parser that:
+      1) Matches single-line transactions (date + desc + amount + Cr/Dr), OR
+      2) For date-only or date+desc lines, accumulates the next lines until it finds
+         a numeric-only amount (Cr/Dr), then treats that as the transaction amount.
     """
-    transactions: List[Tuple[datetime, str, float]] = []
+    doc = fitz.open(path)
+    lines: List[str] = []
+    for page in doc:
+        lines.extend(page.get_text("text").splitlines())
+
     year = get_statement_year(path) or datetime.now().year
+    transactions: List[Tuple[datetime, str, float]] = []
 
-    # pattern for amounts like '1,234.56', with optional 'Cr'/'Dr'
-    number_re = re.compile(r"^(\d{1,3}(?:,\d{3})*\.\d{2})(Cr|Dr)?$", re.IGNORECASE)
+    single_re = re.compile(
+        r'^\s*(\d{1,2})\s+([A-Za-z]{3})\s+(.+?)\s+'
+        r'(\d{1,3}(?:,\d{3})*\.\d{2})(Cr|Dr)?\s*$',
+        re.IGNORECASE
+    )
+    start_re = re.compile(
+        r'^\s*(\d{1,2})\s+([A-Za-z]{3})(?:\s+(.+))?$',
+        re.IGNORECASE
+    )
+    num_re = re.compile(r'^(\d{1,3}(?:,\d{3})*\.\d{2})(Cr|Dr)?$', re.IGNORECASE)
 
-    try:
-        doc = fitz.open(path)
-        for page in doc:
-            for raw in page.get_text("text").splitlines():
-                parts = raw.strip().split()
-                if len(parts) < 4:
-                    continue
+    i = 0
+    n = len(lines)
+    while i < n:
+        raw = lines[i].strip()
 
-                day, mon = parts[0], parts[1]
-                if not day.isdigit() or not re.match(r"^[A-Za-z]{3}$", mon):
-                    continue
+        # 1) Single-line match: date + desc + amount + Cr/Dr
+        m1 = single_re.match(raw)
+        if m1:
+            day, mon, desc, num_str, drcr = m1.groups()
+            amt = float(num_str.replace(",", ""))
+            if not drcr or not drcr.lower().startswith("cr"):
+                amt = -amt
+            try:
+                dt = datetime.strptime(f"{day} {mon} {year}", "%d %b %Y")
+                transactions.append((dt, desc.strip(), amt))
+            except ValueError:
+                pass
+            i += 1
+            continue
 
-                # collect description tokens until we hit the first amount token
-                desc_tokens = []
-                amount = None
+        # 2) Start-of-record (date-only or date+desc)
+        m2 = start_re.match(raw)
+        if m2:
+            day, mon, rest = m2.groups()
+            desc_lines: List[str] = []
+            if rest:
+                desc_lines.append(rest.strip())
 
-                for token in parts[2:]:
-                    m = number_re.match(token)
-                    if m:
-                        num_str, drcr = m.groups()
-                        amt = float(num_str.replace(",", ""))
-                        # if no 'Cr', treat as debit
-                        if not drcr or not drcr.lower().startswith("cr"):
-                            amt = -amt
-                        amount = amt
-                        break
-                    else:
-                        desc_tokens.append(token)
+            # scan forward for the first numeric-only line
+            j = i + 1
+            found_amt = False
+            while j < n:
+                nxt = lines[j].strip()
+                # new record start? then abort
+                if start_re.match(nxt):
+                    break
+                m3 = num_re.match(nxt)
+                if m3:
+                    num_str, drcr = m3.groups()
+                    amt = float(num_str.replace(",", ""))
+                    if not drcr or not drcr.lower().startswith("cr"):
+                        amt = -amt
+                    desc = " ".join(desc_lines).strip()
+                    try:
+                        dt = datetime.strptime(f"{day} {mon} {year}", "%d %b %Y")
+                        transactions.append((dt, desc, amt))
+                    except ValueError:
+                        pass
+                    found_amt = True
+                    break
+                # accumulate as description
+                desc_lines.append(nxt)
+                j += 1
 
-                if amount is None:
-                    continue  # no valid amount on this line
+            # skip ahead (either to the amount line or to the next potential record)
+            i = (j + 1) if found_amt else (i + 1)
+            continue
 
-                desc = " ".join(desc_tokens)
-                try:
-                    dt = datetime.strptime(f"{day} {mon} {year}", "%d %b %Y")
-                except ValueError:
-                    continue
-
-                transactions.append((dt, desc, amount))
-
-    except Exception:
-        pass  # skip files that won't open
+        # not a transaction-start line
+        i += 1
 
     return transactions
 
 
 def parse_balances(path: str) -> Tuple[Optional[float], Optional[float]]:
     """
-    Finds 'Opening Balance X,XXX.XX Cr/Dr' and 'Closing Balance ...'
+    Looks for 'Opening Balance 12,345.67 Cr/Dr' and 'Closing Balance ...' on each page.
     """
     opening: Optional[float] = None
     closing: Optional[float] = None
-
     try:
         doc = fitz.open(path)
     except Exception:
@@ -142,7 +173,7 @@ def parse_balances(path: str) -> Tuple[Optional[float], Optional[float]]:
         re.IGNORECASE
     )
     for page in doc:
-        text = page.get_text()
+        text = page.get_text("text")
         for match in pattern.finditer(text):
             label, num_str, suffix = match.groups()
             amt = float(num_str.replace(",", ""))
@@ -160,32 +191,28 @@ def parse_balances(path: str) -> Tuple[Optional[float], Optional[float]]:
 
 def classify_transaction(description: str, amount: float) -> str:
     desc = (description or "").lower()
-
-    # income vs transfers
+    # positives: income vs transfers
     if amount > 0:
         for kw in CATEGORY_KEYWORDS["Income"]:
             if kw in desc:
                 return "Income"
         return "Transfers"
-
-    # match expense categories
+    # match expense buckets
     for cat, kws in CATEGORY_KEYWORDS.items():
         if cat == "Income":
             continue
         for kw in kws:
             if kw in desc:
                 return cat
-
-    # fallback: small debits → Other; large debits → Uncategorized
-    if abs(amount) <= 500:
-        return "Other"
-    return "Uncategorized"
+    # fallback: small expenses → Other; large ones → Uncategorized
+    return "Other" if abs(amount) <= 500 else "Uncategorized"
 
 
 def main():
     st.set_page_config(page_title="FNB Statement Analyzer", layout="wide")
     st.title("📑 FNB Bank Statement Analyzer")
 
+    # simple sidebar password
     pwd = st.sidebar.text_input("Password", type="password")
     if pwd != DEFAULT_PASSWORD:
         st.sidebar.warning("Enter the password to proceed")
@@ -194,17 +221,17 @@ def main():
     uploaded = st.file_uploader(
         "Upload your FNB bank statement PDFs",
         type=["pdf"],
-        accept_multiple_files=True
+        accept_multiple_files=True,
     )
     if not uploaded:
         st.info("Please upload one or more PDF bank statements to continue.")
         return
 
-    balance_data = []
-    all_transactions = []
+    balance_rows = []
+    all_txns: List[Tuple[datetime, str, float, str]] = []
 
     for file in uploaded:
-        # write to temp file for PyMuPDF
+        # save to temp for PyMuPDF
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
             tmp.write(file.read())
             tmp_path = tmp.name
@@ -212,11 +239,12 @@ def main():
         opening, closing = parse_balances(tmp_path)
         txns = parse_transactions(tmp_path)
 
+        # compute expected closing
         expected = None
         if opening is not None:
             expected = opening + sum(amt for _, _, amt in txns)
 
-        balance_data.append({
+        balance_rows.append({
             "Statement": file.name,
             "Opening": opening,
             "Expected Closing": expected,
@@ -225,27 +253,23 @@ def main():
         })
 
         for dt, desc, amt in txns:
-            all_transactions.append((dt, desc, amt, file.name))
+            all_txns.append((dt, desc, amt, file.name))
 
-    # --- Balance check ---
+    # Balance check
     st.subheader("Balance Check per Statement")
-    df_bal = pd.DataFrame(balance_data)
+    df_bal = pd.DataFrame(balance_rows)
     st.dataframe(
         df_bal[["Statement", "Opening", "Expected Closing", "Actual Closing", "Difference"]],
         use_container_width=True
     )
 
-    # --- Transactions & categories ---
-    df_tx = pd.DataFrame(
-        all_transactions,
-        columns=["Date", "Description", "Amount", "Source"]
-    )
+    # Transactions & categorization
+    df_tx = pd.DataFrame(all_txns, columns=["Date", "Description", "Amount", "Source"])
     df_tx["Category"] = df_tx.apply(
-        lambda r: classify_transaction(r.Description, r.Amount),
-        axis=1
+        lambda r: classify_transaction(r.Description, r.Amount), axis=1
     )
 
-    # --- Summary ---
+    # Summary
     st.subheader("Summary of Spending and Income")
     summary = (
         df_tx.groupby("Category")["Amount"]
@@ -257,7 +281,7 @@ def main():
     )
     st.dataframe(summary, use_container_width=True)
 
-    # --- Bar chart ---
+    # Bar chart
     st.subheader("Spending by Category")
     chart = (
         alt.Chart(summary)
