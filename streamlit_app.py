@@ -11,7 +11,7 @@ import streamlit as st
 import altair as alt
 
 # Debug banner
-st.sidebar.markdown("**🐛 Parser version:** 2025-07-27-v2")
+st.sidebar.markdown("**🐛 Parser version:** 2025-07-27-v3")
 
 DEFAULT_PASSWORD = "changeme"
 
@@ -60,7 +60,6 @@ def get_statement_year(path: str) -> Optional[int]:
             m = re.search(r"Statement Date\s*:\s*\d{1,2} [A-Za-z]+ (\d{4})", text)
             if m:
                 return int(m.group(1))
-            break
     except Exception:
         return None
     return None
@@ -91,7 +90,7 @@ def parse_transactions(path: str) -> List[Tuple[datetime, str, float]]:
     while i < n:
         raw = lines[i].strip()
 
-        # 1) single-line
+        # 1) single-line transaction
         m1 = single_re.match(raw)
         if m1:
             day, mon, desc, num_str, drcr = m1.groups()
@@ -106,7 +105,7 @@ def parse_transactions(path: str) -> List[Tuple[datetime, str, float]]:
             i += 1
             continue
 
-        # 2) multi-line
+        # 2) multi-line transaction
         m2 = start_re.match(raw)
         if m2:
             day, mon, rest = m2.groups()
@@ -118,6 +117,7 @@ def parse_transactions(path: str) -> List[Tuple[datetime, str, float]]:
             found = False
             while j < n:
                 nxt = lines[j].strip()
+                # New transaction starts when date+month pattern appears again
                 if start_re.match(nxt):
                     break
                 m3 = num_re.match(nxt)
@@ -137,7 +137,7 @@ def parse_transactions(path: str) -> List[Tuple[datetime, str, float]]:
                 desc_lines.append(nxt)
                 j += 1
 
-            i = (j + 1) if found else (i + 1)
+            i = j + 1 if found else i + 1
             continue
 
         i += 1
@@ -146,30 +146,44 @@ def parse_transactions(path: str) -> List[Tuple[datetime, str, float]]:
 
 
 def parse_balances(path: str) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Grabs the Opening and Closing balances by matching:
+      - 'Opening balance [as at ...] R1,234.56'
+      - 'Closing balance [as at ...] R1,234.56'
+    """
     opening: Optional[float] = None
     closing: Optional[float] = None
+
     try:
         doc = fitz.open(path)
     except Exception:
         return opening, closing
 
-    pattern = re.compile(
-        r"(Opening|Closing) Balance\s+([\d,]+\.\d{2})\s*(Cr|Dr)?",
+    # Consolidate all text so we can match across lines
+    full_text = "\n".join(page.get_text("text") for page in doc)
+
+    # Regex covers optional "as at DD/MM/YYYY", optional colon or spaces, and optional "R" symbol
+    bal_re = re.compile(
+        r"(Opening|Closing)\s*balance"                              # label
+        r"(?:\s*as at\s*[\d/]{1,10})?"                              # optional "as at" date
+        r"[:\sRr]*"                                                 # optional separator and currency R
+        r"([\d,]+\.\d{2})"                                          # amount
+        r"(?:\s*(Cr|Dr))?",                                         # optional Cr/Dr
         re.IGNORECASE
     )
-    for page in doc:
-        text = page.get_text("text")
-        for match in pattern.finditer(text):
-            label, num_str, suffix = match.groups()
-            amt = float(num_str.replace(",", ""))
-            if suffix and suffix.lower().startswith("dr"):
-                amt = -amt
-            if label.lower().startswith("opening"):
-                opening = amt
-            else:
-                closing = amt
-        if opening is not None and closing is not None:
-            break
+
+    for m in bal_re.finditer(full_text):
+        label = m.group(1).lower()
+        num_str = m.group(2)
+        suffix = m.group(3)
+        amt = float(num_str.replace(",", ""))
+        if suffix and suffix.lower().startswith("dr"):
+            amt = -amt
+
+        if label == "opening":
+            opening = amt
+        elif label == "closing":
+            closing = amt
 
     return opening, closing
 
@@ -222,6 +236,7 @@ def main():
 
         # Debug: show count per file
         st.sidebar.write(f"{file.name}: parsed {len(txns)} transactions")
+        st.sidebar.write(f"{file.name}: opening={opening}, closing={closing}")
 
         expected = None
         if opening is not None:
