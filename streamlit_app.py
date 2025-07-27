@@ -10,6 +10,9 @@ import pandas as pd
 import streamlit as st
 import altair as alt
 
+# Debug banner
+st.sidebar.markdown("**🐛 Parser version:** 2025-07-27-v2")
+
 DEFAULT_PASSWORD = "changeme"
 
 CATEGORY_KEYWORDS = {
@@ -64,13 +67,8 @@ def get_statement_year(path: str) -> Optional[int]:
 
 
 def parse_transactions(path: str) -> List[Tuple[datetime, str, float]]:
-    """
-    Two-stage parser:
-      1) single-line records (date + desc + amount + Cr/Dr)
-      2) multi-line: date ± desc on one line, then amount on one of the next lines
-    """
     doc = fitz.open(path)
-    lines = []
+    lines: List[str] = []
     for page in doc:
         lines.extend(page.get_text("text").splitlines())
 
@@ -108,7 +106,7 @@ def parse_transactions(path: str) -> List[Tuple[datetime, str, float]]:
             i += 1
             continue
 
-        # 2) multi-line (date ± desc, then amount)
+        # 2) multi-line
         m2 = start_re.match(raw)
         if m2:
             day, mon, rest = m2.groups()
@@ -121,7 +119,7 @@ def parse_transactions(path: str) -> List[Tuple[datetime, str, float]]:
             while j < n:
                 nxt = lines[j].strip()
                 if start_re.match(nxt):
-                    break  # next record starts
+                    break
                 m3 = num_re.match(nxt)
                 if m3:
                     num_str, drcr = m3.groups()
@@ -148,9 +146,6 @@ def parse_transactions(path: str) -> List[Tuple[datetime, str, float]]:
 
 
 def parse_balances(path: str) -> Tuple[Optional[float], Optional[float]]:
-    """
-    Finds 'Opening Balance X,XXX.XX Cr/Dr' and 'Closing Balance ...'
-    """
     opening: Optional[float] = None
     closing: Optional[float] = None
     try:
@@ -224,6 +219,9 @@ def main():
 
         opening, closing = parse_balances(tmp_path)
         txns = parse_transactions(tmp_path)
+
+        # Debug: show count per file
+        st.sidebar.write(f"{file.name}: parsed {len(txns)} transactions")
 
         expected = None
         if opening is not None:
