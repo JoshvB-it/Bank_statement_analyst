@@ -1,6 +1,5 @@
 # streamlit_app.py
 
-import os
 import re
 import tempfile
 from datetime import datetime
@@ -51,9 +50,6 @@ CATEGORY_KEYWORDS = {
 
 
 def get_statement_year(path: str) -> Optional[int]:
-    """
-    Reads the first page looking for 'Statement Date : DD MMM YYYY' to extract the year.
-    """
     try:
         doc = fitz.open(path)
         for page in doc:
@@ -69,13 +65,12 @@ def get_statement_year(path: str) -> Optional[int]:
 
 def parse_transactions(path: str) -> List[Tuple[datetime, str, float]]:
     """
-    Robust, two-pass parser that:
-      1) Matches single-line transactions (date + desc + amount + Cr/Dr), OR
-      2) For date-only or date+desc lines, accumulates the next lines until it finds
-         a numeric-only amount (Cr/Dr), then treats that as the transaction amount.
+    Two-stage parser:
+      1) single-line records (date + desc + amount + Cr/Dr)
+      2) multi-line: date ± desc on one line, then amount on one of the next lines
     """
     doc = fitz.open(path)
-    lines: List[str] = []
+    lines = []
     for page in doc:
         lines.extend(page.get_text("text").splitlines())
 
@@ -98,7 +93,7 @@ def parse_transactions(path: str) -> List[Tuple[datetime, str, float]]:
     while i < n:
         raw = lines[i].strip()
 
-        # 1) Single-line match: date + desc + amount + Cr/Dr
+        # 1) single-line
         m1 = single_re.match(raw)
         if m1:
             day, mon, desc, num_str, drcr = m1.groups()
@@ -113,7 +108,7 @@ def parse_transactions(path: str) -> List[Tuple[datetime, str, float]]:
             i += 1
             continue
 
-        # 2) Start-of-record (date-only or date+desc)
+        # 2) multi-line (date ± desc, then amount)
         m2 = start_re.match(raw)
         if m2:
             day, mon, rest = m2.groups()
@@ -121,14 +116,12 @@ def parse_transactions(path: str) -> List[Tuple[datetime, str, float]]:
             if rest:
                 desc_lines.append(rest.strip())
 
-            # scan forward for the first numeric-only line
             j = i + 1
-            found_amt = False
+            found = False
             while j < n:
                 nxt = lines[j].strip()
-                # new record start? then abort
                 if start_re.match(nxt):
-                    break
+                    break  # next record starts
                 m3 = num_re.match(nxt)
                 if m3:
                     num_str, drcr = m3.groups()
@@ -141,17 +134,14 @@ def parse_transactions(path: str) -> List[Tuple[datetime, str, float]]:
                         transactions.append((dt, desc, amt))
                     except ValueError:
                         pass
-                    found_amt = True
+                    found = True
                     break
-                # accumulate as description
                 desc_lines.append(nxt)
                 j += 1
 
-            # skip ahead (either to the amount line or to the next potential record)
-            i = (j + 1) if found_amt else (i + 1)
+            i = (j + 1) if found else (i + 1)
             continue
 
-        # not a transaction-start line
         i += 1
 
     return transactions
@@ -159,7 +149,7 @@ def parse_transactions(path: str) -> List[Tuple[datetime, str, float]]:
 
 def parse_balances(path: str) -> Tuple[Optional[float], Optional[float]]:
     """
-    Looks for 'Opening Balance 12,345.67 Cr/Dr' and 'Closing Balance ...' on each page.
+    Finds 'Opening Balance X,XXX.XX Cr/Dr' and 'Closing Balance ...'
     """
     opening: Optional[float] = None
     closing: Optional[float] = None
@@ -191,20 +181,17 @@ def parse_balances(path: str) -> Tuple[Optional[float], Optional[float]]:
 
 def classify_transaction(description: str, amount: float) -> str:
     desc = (description or "").lower()
-    # positives: income vs transfers
     if amount > 0:
         for kw in CATEGORY_KEYWORDS["Income"]:
             if kw in desc:
                 return "Income"
         return "Transfers"
-    # match expense buckets
     for cat, kws in CATEGORY_KEYWORDS.items():
         if cat == "Income":
             continue
         for kw in kws:
             if kw in desc:
                 return cat
-    # fallback: small expenses → Other; large ones → Uncategorized
     return "Other" if abs(amount) <= 500 else "Uncategorized"
 
 
@@ -212,16 +199,15 @@ def main():
     st.set_page_config(page_title="FNB Statement Analyzer", layout="wide")
     st.title("📑 FNB Bank Statement Analyzer")
 
-    # simple sidebar password
     pwd = st.sidebar.text_input("Password", type="password")
     if pwd != DEFAULT_PASSWORD:
         st.sidebar.warning("Enter the password to proceed")
         st.stop()
 
     uploaded = st.file_uploader(
-        "Upload your FNB bank statement PDFs",
+        "Upload FNB bank statement PDFs",
         type=["pdf"],
-        accept_multiple_files=True,
+        accept_multiple_files=True
     )
     if not uploaded:
         st.info("Please upload one or more PDF bank statements to continue.")
@@ -231,7 +217,7 @@ def main():
     all_txns: List[Tuple[datetime, str, float, str]] = []
 
     for file in uploaded:
-        # save to temp for PyMuPDF
+        # write to a temp file
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
             tmp.write(file.read())
             tmp_path = tmp.name
@@ -239,7 +225,6 @@ def main():
         opening, closing = parse_balances(tmp_path)
         txns = parse_transactions(tmp_path)
 
-        # compute expected closing
         expected = None
         if opening is not None:
             expected = opening + sum(amt for _, _, amt in txns)
@@ -255,7 +240,7 @@ def main():
         for dt, desc, amt in txns:
             all_txns.append((dt, desc, amt, file.name))
 
-    # Balance check
+    # Balance check table
     st.subheader("Balance Check per Statement")
     df_bal = pd.DataFrame(balance_rows)
     st.dataframe(
