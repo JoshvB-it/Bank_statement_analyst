@@ -4,182 +4,304 @@ import re
 import tempfile
 from datetime import datetime
 from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict, Any
 
 import fitz  # PyMuPDF
 import pandas as pd
 import streamlit as st
-import altair as alt
 
-# Debug banner
-st.sidebar.markdown("**🐛 Parser version:** 2025-07-27-v5")
+# ---------------- UI / Meta ----------------
+st.set_page_config(page_title="FNB Statement Analyzer", layout="wide")
+st.sidebar.markdown("**🐛 Parser version:** 2025-08-08-r1")
 
 DEFAULT_PASSWORD = "changeme"
 
-CATEGORY_KEYWORDS = {
-    "Income": ["pwc", "krans", "stefani", "salary", "bonus", "income", "deposit"],
-    "Groceries": [
-        "woolworths", "cc fresh", "fresh x", "pick n pay", "spar",
-        "checkers", "food lovers", "pnp", "spaza", "fruit and veg"
-    ],
-    "Health & Pharmacy": ["clicks", "dis-chem", "pharmacy", "chemist", "clinic"],
-    "Clothing & Accessories": [
-        "mr price", "mrp", "takkie", "tekkie", "k jewels", "jeweller",
-        "jewellery", "sheetstreet", "sportscene", "pep home", "pep",
-        "edgars", "sport"
-    ],
-    "Food & Drink": [
-        "bk ", "kfc", "mcd", "roco", "spur", "king pie", "mochachos",
-        "milky lane", "salsa", "mama", "restaurant", "coffee", "diner",
-        "pizza", "steers", "galitos", "burger", "chips"
-    ],
-    "Fuel & Transport": [
-        "engen", "sasol", "bp", "caltex", "shell", "petrol", "diesel",
-        "parking", "uber", "bolt"
-    ],
-    "Entertainment & Digital": [
-        "spotify", "netflix", "apple.com", "microsoft", "play", "itunes",
-        "book", "exclusive books", "gym", "movie", "cinema", "showmax",
-        "hbomax", "disney", "amazon"
-    ],
-    "Education & School": [
-        "laerskool", "school", "tuition", "netcash", "scholar", "fees",
-        "uniform", "books"
-    ],
-    "Bank Charges & Fees": [
-        "byc debit", "service fee", "bank charge", "interest",
-        "facility fee", "admin fee"
-    ],
-}
+# ---------------- Helpers ----------------
+MONTHS_3 = "jan feb mar apr may jun jul aug sep oct nov dec".split()
+
+HEADER_NOISE_PATTERNS = [
+    r"^page\s+\d+\s+of\s+\d+$",
+    r"^fnb\b.*",
+    r"^first national bank\b.*",
+    r"^branch\b.*",
+    r"^account\b.*",
+    r"^statement\b.*",
+    r"^customer\b.*",
+    r"^contact\b.*",
+    r"^vat\b.*",
+    r"^registered\b.*",
+    r"^www\.",
+    r"^tel\b.*",
+]
+
+HEADER_NOISE_RE = [re.compile(pat, re.IGNORECASE) for pat in HEADER_NOISE_PATTERNS]
+
+def is_noise(line: str) -> bool:
+    s = line.strip()
+    if not s:
+        return True
+    for rx in HEADER_NOISE_RE:
+        if rx.match(s):
+            return True
+    return False
 
 
-def get_statement_year(path: str) -> Optional[int]:
+def clean_amount(raw: str) -> float:
+    """
+    Accepts:
+      '1,234.56', 'R 1,234.56', '(1,234.56)', '-1,234.56', '1,234.56 CR', 'DR 1,234.56'
+    Returns signed float (credits positive, debits negative by default).
+    """
+    s = raw.strip()
+    # Pull CR/DR markers (prefix/suffix)
+    cr = bool(re.search(r"\bCR\b", s, re.IGNORECASE))
+    dr = bool(re.search(r"\bDR\b", s, re.IGNORECASE))
+
+    # strip currency and CR/DR text
+    s = re.sub(r"\b(CR|DR)\b", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"[Rr]\s*", "", s).strip()
+
+    neg = False
+    if s.startswith("(") and s.endswith(")"):
+        neg = True
+        s = s[1:-1]
+    if s.startswith("-"):
+        neg = True
+        s = s[1:]
+
+    s = s.replace(",", "")
     try:
-        doc = fitz.open(path)
-        for page in doc:
-            text = page.get_text("text")
-            m = re.search(r"Statement Date\s*:\s*\d{1,2} [A-Za-z]+ (\d{4})", text)
-            if m:
-                return int(m.group(1))
+        val = float(s)
     except Exception:
-        pass
+        raise ValueError(f"Unparseable amount: {raw}")
+
+    # Default sign: debit negative, credit positive. If markers present, override.
+    if cr:
+        val = abs(val)
+    elif dr:
+        val = -abs(val)
+    elif neg:
+        val = -abs(val)
+
+    return val
+
+
+def try_parse_statement_year(text: str) -> Optional[int]:
+    """
+    Try several FNB-ish phrasings to lock the year (more stable than using 'today').
+    """
+    # e.g., "Statement Date : 12 Aug 2024"
+    m = re.search(r"Statement\s*Date\s*:\s*\d{1,2}\s+[A-Za-z]{3,}\s+(\d{4})", text, re.IGNORECASE)
+    if m:
+        return int(m.group(1))
+
+    # e.g., "Period: 01 Jul 2024 to 31 Jul 2024"
+    m = re.search(r"\b(?:Period|From)\b.*?\d{1,2}\s+[A-Za-z]{3,}\s+(\d{4}).*?\bto\b.*?(\d{4})", text, re.IGNORECASE)
+    if m:
+        y1, y2 = int(m.group(1)), int(m.group(2))
+        return y2  # prefer ending year
+
+    # e.g., "as at 31 July 2024"
+    m = re.search(r"\bas\s+at\s+\d{1,2}\s+[A-Za-z]{3,}\s+(\d{4})", text, re.IGNORECASE)
+    if m:
+        return int(m.group(1))
+
     return None
 
 
-def parse_transactions(path: str) -> List[Tuple[datetime, str, float]]:
-    doc = fitz.open(path)
+def tokenize_lines(doc: fitz.Document) -> List[str]:
+    """
+    Use page.get_text('text') but strip obvious non-transaction noise.
+    Keep order.
+    """
     lines: List[str] = []
     for page in doc:
-        lines.extend(page.get_text("text").splitlines())
+        for ln in page.get_text("text").splitlines():
+            s = ln.strip()
+            if is_noise(s):
+                continue
+            lines.append(s)
+    # collapse duplicate blank clusters
+    out = []
+    blank = False
+    for s in lines:
+        if not s:
+            if not blank:
+                out.append(s)
+            blank = True
+        else:
+            out.append(s)
+            blank = False
+    return out
 
-    year = get_statement_year(path) or datetime.now().year
-    transactions: List[Tuple[datetime, str, float]] = []
 
-    single_re = re.compile(
-        r'^\s*(\d{1,2})\s+([A-Za-z]{3})\s+(.+?)\s+'
-        r'(\d{1,3}(?:,\d{3})*\.\d{2})(Cr|Dr)?\s*$',
-        re.IGNORECASE
+# ---------------- Parsers ----------------
+DATE_START_RE = re.compile(r"^\s*(\d{1,2})\s+([A-Za-z]{3})\b(.*)$", re.IGNORECASE)
+AMOUNT_TAIL_RE = re.compile(
+    r"""^
+    (?:
+        (?:[Rr]\s*)?                # optional 'R'
+        (\(?-?\d{1,3}(?:,\d{3})*\.\d{2}\)?)  # amount, with optional parens or leading minus
+        (?:\s*(?:CR|DR))?           # optional CR/DR suffix
+      |
+        (?:CR|DR)\s*
+        (\(?-?\d{1,3}(?:,\d{3})*\.\d{2}\)?)  # amount with CR/DR prefix
     )
-    start_re = re.compile(
-        r'^\s*(\d{1,2})\s+([A-Za-z]{3})(?:\s+(.+))?$', 
-        re.IGNORECASE
-    )
-    num_re = re.compile(r'^(\d{1,3}(?:,\d{3})*\.\d{2})(Cr|Dr)?$', re.IGNORECASE)
+    $""",
+    re.VERBOSE,
+)
+
+
+def parse_transactions_from_lines(lines: List[str], year: int) -> Tuple[List[Tuple[datetime, str, float]], List[str]]:
+    """
+    Transaction structure seen on many FNB PDFs:
+      - Transaction starts with "DD MMM ..." (date + rest-of-line description)
+      - Description may wrap multiple lines
+      - Amount appears alone on the last line of the block (right-justified in the PDF)
+    Returns (transactions, unparsed_candidate_lines)
+    """
+    txns: List[Tuple[datetime, str, float]] = []
+    leftovers: List[str] = []
 
     i, n = 0, len(lines)
     while i < n:
-        raw = lines[i].strip()
-        m1 = single_re.match(raw)
-        if m1:
-            day, mon, desc, num_str, drcr = m1.groups()
-            amt = float(num_str.replace(",", ""))
-            if not drcr or not drcr.lower().startswith("cr"):
-                amt = -amt
-            try:
-                dt = datetime.strptime(f"{day} {mon} {year}", "%d %b %Y")
-                transactions.append((dt, desc.strip(), amt))
-            except ValueError:
-                pass
+        line = lines[i].strip()
+
+        m_date = DATE_START_RE.match(line)
+        if not m_date:
             i += 1
             continue
 
-        m2 = start_re.match(raw)
-        if m2:
-            day, mon, rest = m2.groups()
-            desc_lines = [rest.strip()] if rest else []
-            j = i + 1
-            found = False
-            while j < n:
-                nxt = lines[j].strip()
-                if start_re.match(nxt):
-                    break
-                m3 = num_re.match(nxt)
-                if m3:
-                    num_str, drcr = m3.groups()
-                    amt = float(num_str.replace(",", ""))
-                    if not drcr or not drcr.lower().startswith("cr"):
-                        amt = -amt
-                    desc = " ".join(desc_lines).strip()
-                    try:
-                        dt = datetime.strptime(f"{day} {mon} {year}", "%d %b %Y")
-                        transactions.append((dt, desc, amt))
-                    except ValueError:
-                        pass
-                    found = True
-                    break
-                desc_lines.append(nxt)
-                j += 1
-            i = j + 1 if found else i + 1
+        day, mon, rest = m_date.groups()
+        mon = mon.strip()[:3].lower()
+        if mon not in MONTHS_3:
+            # Not actually a transaction line, keep scanning
+            i += 1
             continue
 
-        i += 1
+        # Build the wrapped description until we hit an amount line or next date
+        desc_parts = []
+        if rest:
+            desc_parts.append(rest.strip())
 
-    return transactions
+        j = i + 1
+        amount_line = None
+        while j < n:
+            cand = lines[j].strip()
+            # next transaction starts?
+            if DATE_START_RE.match(cand):
+                break
+
+            # Is this the amount tail?
+            m_amt = AMOUNT_TAIL_RE.match(cand)
+            if m_amt:
+                amount_line = cand
+                break
+
+            # Otherwise it's part of the description
+            if cand:
+                desc_parts.append(cand)
+            j += 1
+
+        # Attempt to commit a transaction
+        if amount_line:
+            # Normalize description (squash inner spaces)
+            desc = " ".join(" ".join(desc_parts).split())
+            # Extract numeric from amount_line using a tolerant grab
+            # Prefer suffix-form group(1), else prefix-form group(2)
+            m_amt = AMOUNT_TAIL_RE.match(amount_line)
+            raw_amt = m_amt.group(1) or m_amt.group(2)
+            # Re-attach CR/DR text for sign calc
+            crdr = ""
+            if re.search(r"\bCR\b", amount_line, re.IGNORECASE):
+                crdr = " CR"
+            elif re.search(r"\bDR\b", amount_line, re.IGNORECASE):
+                crdr = " DR"
+            amt = clean_amount(f"{raw_amt}{crdr}")
+
+            try:
+                dt = datetime.strptime(f"{int(day):02d} {mon.title()} {year}", "%d %b %Y")
+                txns.append((dt, desc, amt))
+            except Exception:
+                leftovers.append(f"[DATEERR] {day} {mon} :: {desc} :: {amount_line}")
+
+            # advance past amount line
+            i = j + 1
+        else:
+            # Could not find terminating amount before next date/new section
+            snippet = " | ".join([line] + lines[i+1:j])
+            leftovers.append(f"[UNTERMINATED] {snippet[:240]}")
+            i = j  # start from next candidate
+
+    return txns, leftovers
 
 
-def parse_balances(path: str) -> Tuple[Optional[float], Optional[float]]:
+BALANCE_RE = re.compile(
+    r"""
+    \b(Opening|Closing)\s*balance\b
+    (?:\s*(?:as\s*at)?\s*(?:\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{1,2}\s+[A-Za-z]{3,}\s+\d{4}))?
+    [\s:]*[Rr]?\s*
+    (\(?-?\d{1,3}(?:,\d{3})*\.\d{2}\)?)
+    (?:\s*(CR|DR))?
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+ALT_CLOSING_RE = re.compile(
+    r"""
+    \b(?:Available|Current)\s*balance\b
+    (?:\s*(?:as\s*at)?\s*(?:\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{1,2}\s+[A-Za-z]{3,}\s+\d{4}))?
+    [\s:]*[Rr]?\s*
+    (\(?-?\d{1,3}(?:,\d{3})*\.\d{2}\)?)
+    (?:\s*(CR|DR))?
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+def parse_balances_text(text: str) -> Tuple[Optional[float], Optional[float]]:
     opening = None
     closing = None
-    try:
-        doc = fitz.open(path)
-    except Exception:
-        return opening, closing
-
-    full_text = "\n".join(page.get_text("text") for page in doc)
-    date_part = r"(?:as at\s*(?:\d{1,2}/\d{1,2}/\d{2,4}|\d{1,2}\s+[A-Za-z]+\s+\d{4}))?"
-    bal_re = re.compile(
-        rf"(Opening|Closing)\s*balance\s*{date_part}[:\sRr]*([\d,]+\.\d{{2}})(?:\s*(Cr|Dr))?",
-        re.IGNORECASE
-    )
-    for m in bal_re.finditer(full_text):
-        label, num_str, suffix = m.groups()
-        amt = float(num_str.replace(",", ""))
-        if suffix and suffix.lower().startswith("dr"):
-            amt = -amt
-        if label.lower() == "opening":
-            opening = amt
+    for m in BALANCE_RE.finditer(text):
+        label = m.group(1).lower()
+        num = m.group(2)
+        crdr = m.group(3) or ""
+        val = clean_amount(f"{num} {crdr}".strip())
+        if label == "opening":
+            opening = val
         else:
-            closing = amt
+            closing = val
 
     if closing is None:
-        avail_re = re.compile(
-            rf"(?:Available|Current)\s*balance\s*{date_part}[:\sRr]*([\d,]+\.\d{{2}})(?:\s*(Cr|Dr))?",
-            re.IGNORECASE
-        )
-        m2 = avail_re.search(full_text)
-        if m2:
-            num_str, suffix = m2.groups()
-            amt = float(num_str.replace(",", ""))
-            if suffix and suffix.lower().startswith("dr"):
-                amt = -amt
-            closing = amt
-            st.sidebar.warning(f"Fallback 'Available/Current balance' used: {closing:.2f}")
+        m = ALT_CLOSING_RE.search(text)
+        if m:
+            num = m.group(1)
+            crdr = m.group(2) or ""
+            closing = clean_amount(f"{num} {crdr}".strip())
 
     return opening, closing
 
 
+def parse_file(path: str) -> Dict[str, Any]:
+    doc = fitz.open(path)
+    full_text = "\n".join(page.get_text("text") for page in doc)
+    year = try_parse_statement_year(full_text) or datetime.now().year
+
+    lines = tokenize_lines(doc)
+    txns, leftovers = parse_transactions_from_lines(lines, year)
+    opening, closing = parse_balances_text(full_text)
+
+    return {
+        "year": year,
+        "transactions": txns,
+        "opening": opening,
+        "closing": closing,
+        "leftovers": leftovers,
+        "lines": lines,
+    }
+
+
+# ---------------- Streamlit App ----------------
 def main():
-    st.set_page_config(page_title="FNB Statement Analyzer", layout="wide")
     st.title("📑 FNB Bank Statement Analyzer")
 
     pwd = st.sidebar.text_input("Password", type="password")
@@ -192,60 +314,84 @@ def main():
         type=["pdf"],
         accept_multiple_files=True
     )
+
     if not uploaded:
         st.info("Please upload one or more PDF bank statements to continue.")
         return
 
     balance_rows = []
-    all_txns: List[Tuple[datetime, str, float, str]] = []
+    all_tx = []
+
+    show_leftovers = st.sidebar.checkbox("Show unparsed candidate lines", value=True)
 
     for file in uploaded:
-        # save to temp file
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
             tmp.write(file.read())
             tmp_path = tmp.name
 
-        opening, closing = parse_balances(tmp_path)
-        txns = parse_transactions(tmp_path)
-        net_movement = sum(amt for _, _, amt in txns)
-        expected_closing = (opening + net_movement) if opening is not None else None
-        diff = (closing - expected_closing) if (closing is not None and expected_closing is not None) else None
+        parsed = parse_file(tmp_path)
+        txns: List[Tuple[datetime, str, float]] = parsed["transactions"]
+        opening = parsed["opening"]
+        closing = parsed["closing"]
+
+        # Net movement from parsed transactions
+        net = sum(a for _, _, a in txns)
+        expected = (opening + net) if opening is not None else None
+        diff = (closing - expected) if (closing is not None and expected is not None) else None
 
         balance_rows.append({
             "Statement": Path(file.name).stem,
-            "Opening Balance (ZAR)": opening,
-            "Net Movement (ZAR)": net_movement,
-            "Expected Closing (ZAR)": expected_closing,
-            "Actual Closing (ZAR)": closing,
-            "Difference (ZAR)": diff
+            "Opening Balance (ZAR)": None if opening is None else round(opening, 2),
+            "Net Movement (ZAR)": round(net, 2),
+            "Expected Closing (ZAR)": None if expected is None else round(expected, 2),
+            "Actual Closing (ZAR)": None if closing is None else round(closing, 2),
+            "Difference (ZAR)": None if diff is None else round(diff, 2),
+            "Parsed Tx Count": len(txns),
         })
 
         for dt, desc, amt in txns:
-            all_txns.append({
+            all_tx.append({
                 "Statement": Path(file.name).stem,
                 "Date": dt,
                 "Description": desc,
-                "Amount (ZAR)": amt
+                "Amount (ZAR)": round(amt, 2)
             })
 
+        # Diagnostics panel per statement
+        with st.expander(f"🔎 Diagnostics — {Path(file.name).stem}", expanded=False):
+            c1, c2 = st.columns(2)
+            with c1:
+                st.write("**Detected year:**", parsed["year"])
+                st.write("**Opening / Closing (raw parsed):**", opening, closing)
+                st.write("**Transactions parsed:**", len(txns))
+            with c2:
+                if show_leftovers and parsed["leftovers"]:
+                    st.write("**Unparsed candidate lines** (investigate these):")
+                    st.dataframe(pd.DataFrame({"snippet": parsed["leftovers"]}))
+                else:
+                    st.write("No leftover candidates (good sign).")
+
     # Detailed transactions
-    st.subheader("Detailed Transactions by Statement")
-    df_tx = pd.DataFrame(all_txns)
-    # round amounts to 2dp
-    df_tx["Amount (ZAR)"] = df_tx["Amount (ZAR)"].round(2)
-    st.dataframe(df_tx, use_container_width=True)
+    st.subheader("Detailed Transactions")
+    if all_tx:
+        df_tx = pd.DataFrame(all_tx).sort_values(["Statement", "Date"]).reset_index(drop=True)
+        st.dataframe(df_tx, use_container_width=True)
+    else:
+        st.info("No transactions parsed yet.")
 
     # Balance reconciliation
     st.subheader("Balance Reconciliation Summary")
     df_bal = pd.DataFrame(balance_rows)
-    for col in ["Opening Balance (ZAR)", "Net Movement (ZAR)", "Expected Closing (ZAR)", "Actual Closing (ZAR)", "Difference (ZAR)"]:
-        df_bal[col] = df_bal[col].round(2)
-    st.dataframe(df_bal, use_container_width=True)
+    if not df_bal.empty:
+        st.dataframe(df_bal, use_container_width=True)
+        any_diff = df_bal["Difference (ZAR)"].notna() & (df_bal["Difference (ZAR)"].abs() > 0.01)
+        if any_diff.any():
+            st.warning("Some statements have differences. Expand Diagnostics above and check **Unparsed candidate lines** for the culprits.")
+        else:
+            st.success("All statements reconcile (Expected Closing == Actual Closing).")
+    else:
+        st.info("No balances to show yet.")
 
-    # (Optional) keep your category summary/chart below if you still want it
-    # ...
-    # st.subheader("Summary of Spending and Income")
-    # [your existing summary code here]
 
 if __name__ == "__main__":
     main()
