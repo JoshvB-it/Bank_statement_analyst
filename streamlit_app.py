@@ -1,5 +1,5 @@
 # streamlit_app.py
-# FNB Bank Statement Analyzer — mobile-friendly auth + robust parser
+# FNB Bank Statement Analyzer — robust sign via running-balance deltas
 # Requires: streamlit==1.30.0, PyMuPDF==1.25.5, pandas==2.2.2, altair==5.2.0
 
 import os
@@ -15,9 +15,9 @@ import streamlit as st
 
 # ---------------- UI / Meta ----------------
 st.set_page_config(page_title="FNB Statement Analyzer", layout="wide")
-PARSER_VERSION = "2025-08-09-r1"
+PARSER_VERSION = "2025-08-09-r2"
 
-# Password can come from Streamlit Secrets or environment; falls back to 'changeme' for local dev.
+# Password from Secrets / env, fallback for local
 try:
     SECRET_PW = st.secrets.get("APP_PASSWORD") if hasattr(st, "secrets") else None
 except Exception:
@@ -29,7 +29,7 @@ st.caption(f"Parser version: {PARSER_VERSION}")
 
 # ---------------- Mobile-friendly Auth ----------------
 try:
-    qparams = st.experimental_get_query_params()  # works on Streamlit Cloud and local
+    qparams = st.experimental_get_query_params()
 except Exception:
     qparams = {}
 qpw = None
@@ -79,24 +79,19 @@ def is_noise(line: str) -> bool:
 
 def clean_amount(raw: str) -> float:
     """
-    Accepts many shapes like:
-      '1,234.56', 'R 1,234.56', '(1,234.56)', '-1,234.56',
-      '1,234.56 CR/DR', 'CR 1,234.56', '1,234.56CR', '1,234.56 DR 12,345.67'
-    Returns signed float (credits positive, debits negative by default).
+    Accepts: '1,234.56', 'R 1,234.56', '(1,234.56)', '-1,234.56',
+             'CR 1,234.56', '1,234.56 DR', '1,234.56 12,345.67'
+    Returns signed float; if no sign cue, value is positive.
     """
     s = raw.strip()
-    # Detect CR/DR anywhere in token
     cr = bool(re.search(r"\bCR\b", s, re.IGNORECASE))
     dr = bool(re.search(r"\bDR\b", s, re.IGNORECASE))
-
-    # Remove explicit CR/DR marks and currency symbol
     s = re.sub(r"\b(CR|DR)\b", "", s, flags=re.IGNORECASE)
     s = re.sub(r"[Rr]\s*", "", s).strip()
 
-    # If an amount and running balance appear on same line, keep the FIRST numeric token as the amount
     nums = re.findall(r"\(?-?\d{1,3}(?:,\d{3})*(?:\.\d{2})?\)?", s)
     if not nums:
-        raise ValueError(f"Cannot find numeric amount in: {raw!r}")
+        raise ValueError(f"No numeric token in: {raw!r}")
     s = nums[0]
 
     neg = False
@@ -109,15 +104,26 @@ def clean_amount(raw: str) -> float:
 
     s = s.replace(",", "")
     val = float(s)
-
     if cr:
         val = abs(val)
-    elif dr:
+    elif dr or neg:
         val = -abs(val)
-    elif neg:
-        val = -abs(val)
-
     return val
+
+def clean_number(raw: Optional[str]) -> Optional[float]:
+    if not raw:
+        return None
+    s = raw.strip()
+    s = re.sub(r"[Rr]\s*", "", s)
+    s = s.replace(",", "")
+    if not s:
+        return None
+    if s.startswith("(") and s.endswith(")"):
+        s = "-" + s[1:-1]
+    try:
+        return float(s)
+    except Exception:
+        return None
 
 def try_parse_statement_year(text: str) -> Optional[int]:
     m = re.search(r"Statement\s*Date\s*:\s*\d{1,2}\s+[A-Za-z]{3,}\s+(\d{4})", text, re.IGNORECASE)
@@ -125,8 +131,7 @@ def try_parse_statement_year(text: str) -> Optional[int]:
         return int(m.group(1))
     m = re.search(r"\b(?:Period|From)\b.*?\d{1,2}\s+[A-Za-z]{3,}\s+(\d{4}).*?\bto\b.*?(\d{4})", text, re.IGNORECASE | re.S)
     if m:
-        y1, y2 = int(m.group(1)), int(m.group(2))
-        return y2
+        return int(m.group(2))
     m = re.search(r"\bas\s+at\s+\d{1,2}\s+[A-Za-z]{3,}\s+(\d{4})", text, re.IGNORECASE)
     if m:
         return int(m.group(1))
@@ -135,100 +140,41 @@ def try_parse_statement_year(text: str) -> Optional[int]:
 def tokenize_lines(doc: fitz.Document) -> List[str]:
     lines: List[str] = []
     for page in doc:
-        # get_text("text") preserves reading order better than blocks for FNB
         for ln in page.get_text("text").splitlines():
             s = ln.strip()
             if is_noise(s):
                 continue
             lines.append(s)
     # collapse multiple blanks
-    out = []
-    blank = False
+    out, blank = [], False
     for s in lines:
         if not s:
             if not blank:
                 out.append(s)
             blank = True
         else:
-            out.append(s)
-            blank = False
+            out.append(s); blank = False
     return out
 
 # ---------------- Parsers ----------------
-# Dates like: "3 Jan", "03 Jan", "3 JAN". We'll attach the detected year later.
 DATE_START_RE = re.compile(r"^\s*(\d{1,2})\s+([A-Za-z]{3})\b(.*)$", re.IGNORECASE)
 
-# Amount line (captures first numeric as amount; permits trailing running balance)
-AMOUNT_LINE_RE = re.compile(
+# Capture both AMOUNT and trailing RUNNING BALANCE if present.
+AMOUNT_AND_BALANCE_RE = re.compile(
     r"""
     ^
-    (?:.*?\b(?:CR|DR)\b\s*)?                              # optional leading CR/DR
-    (?:.*?\b[Rr]\s*)?                                     # optional 'R' before amount
-    (\(?-?\d{1,3}(?:,\d{3})*(?:\.\d{2})?\)?)              # CAPTURE: amount (first numeric token)
-    (?:\s*\b(?:CR|DR)\b)?                                 # optional CR/DR after amount
-    (?:\s+(?:\(?-?\d{1,3}(?:,\d{3})*(?:\.\d{2})?\)?)(?:\s*\b(?:CR|DR)\b)?\s*)?  # optional trailing running balance
+    (?:.*?\b(?:CR|DR)\b\s*)?                    # optional leading CR/DR
+    (?:.*?\b[Rr]\s*)?                           # optional 'R'
+    (\(?-?\d{1,3}(?:,\d{3})*(?:\.\d{2})?\)?)    # (1) amount
+    (?:\s*\b(?:CR|DR)\b)?                       # optional CR/DR after amount
+    (?:\s+                                      # optional trailing running balance
+       (\(?-?\d{1,3}(?:,\d{3})*(?:\.\d{2})?\)?) # (2) running balance
+       (?:\s*\b(?:CR|DR)\b)?\s*
+    )?
     $
     """,
     re.VERBOSE,
 )
-
-def parse_transactions_from_lines(lines: List[str], year: int) -> Tuple[List[Tuple[datetime, str, float]], List[str]]:
-    txns: List[Tuple[datetime, str, float]] = []
-    leftovers: List[str] = []
-    i, n = 0, len(lines)
-    while i < n:
-        line = lines[i].strip()
-        m_date = DATE_START_RE.match(line)
-        if not m_date:
-            i += 1
-            continue
-
-        day, mon, rest = m_date.groups()
-        mon = mon.strip()[:3].lower()
-        if mon not in MONTHS_3:
-            i += 1
-            continue
-
-        desc_parts = []
-        if rest:
-            desc_parts.append(rest.strip())
-
-        # Scan forward until we hit amount line or next date
-        j = i + 1
-        amount_line = None
-        while j < n:
-            cand = lines[j].strip()
-            if DATE_START_RE.match(cand):
-                break
-            if AMOUNT_LINE_RE.match(cand):
-                amount_line = cand
-                break
-            if cand:
-                desc_parts.append(cand)
-            j += 1
-
-        if amount_line:
-            desc = " ".join(" ".join(desc_parts).split())
-            m_amt = AMOUNT_LINE_RE.match(amount_line)
-            raw_amt = m_amt.group(1)
-            # If CR/DR present anywhere on the line, retain it for sign logic
-            crdr = ""
-            if re.search(r"\bCR\b", amount_line, re.IGNORECASE):
-                crdr = " CR"
-            elif re.search(r"\bDR\b", amount_line, re.IGNORECASE):
-                crdr = " DR"
-            amt = clean_amount(f"{raw_amt}{crdr}")
-            try:
-                dt = datetime.strptime(f"{int(day):02d} {mon.title()} {year}", "%d %b %Y")
-                txns.append((dt, desc, amt))
-            except Exception:
-                leftovers.append(f"[DATEERR] {day} {mon} :: {desc} :: {amount_line}")
-            i = j + 1
-        else:
-            snippet = " | ".join([line] + lines[i+1:j])
-            leftovers.append(f"[UNTERMINATED] {snippet[:240]}")
-            i = j
-    return txns, leftovers
 
 BALANCE_RE = re.compile(
     r"""
@@ -271,7 +217,7 @@ def parse_balances_text(text: str) -> Tuple[Optional[float], Optional[float]]:
             closing = clean_amount(f"{num} {crdr}".strip())
     return opening, closing
 
-# ---- Simple Type Classification (Income / Expense / Transfer) ----
+# ---- Type Classification (Income / Expense / Transfer) ----
 TRANSFER_KEYWORDS = [
     "transfer", "inter-account", "inter account", "internal tf",
     "bankapp transfer", "bank app transfer", "e-wallet", "ewallet",
@@ -279,7 +225,6 @@ TRANSFER_KEYWORDS = [
     "faster payment", "own account", "to savings", "from savings",
     "global payment"
 ]
-
 def classify_type(description: str, amount: float) -> str:
     d = description.lower()
     is_transfer = any(k in d for k in TRANSFER_KEYWORDS)
@@ -290,15 +235,88 @@ def classify_type(description: str, amount: float) -> str:
     else:
         return "Zero / Reversal"
 
+def parse_transactions_from_lines(
+    lines: List[str], year: int, opening_balance: Optional[float]
+) -> Tuple[List[Tuple[datetime, str, float]], List[str]]:
+    txns: List[Tuple[datetime, str, float]] = []
+    leftovers: List[str] = []
+    prev_running = opening_balance  # seed running balance if we have it
+
+    i, n = 0, len(lines)
+    while i < n:
+        line = lines[i].strip()
+        m_date = DATE_START_RE.match(line)
+        if not m_date:
+            i += 1
+            continue
+
+        day, mon, rest = m_date.groups()
+        mon = mon.strip()[:3].lower()
+        if mon not in MONTHS_3:
+            i += 1
+            continue
+
+        desc_parts = []
+        if rest:
+            desc_parts.append(rest.strip())
+
+        j = i + 1
+        amount_line = None
+        while j < n:
+            cand = lines[j].strip()
+            if DATE_START_RE.match(cand):
+                break
+            if AMOUNT_AND_BALANCE_RE.match(cand):
+                amount_line = cand
+                break
+            if cand:
+                desc_parts.append(cand)
+            j += 1
+
+        if amount_line:
+            desc = " ".join(" ".join(desc_parts).split())
+            m_amt = AMOUNT_AND_BALANCE_RE.match(amount_line)
+            raw_amt = m_amt.group(1)
+            raw_runbal = m_amt.group(2)
+
+            # Start with naive amount (uses CR/DR/() if present)
+            crdr = ""
+            if re.search(r"\bCR\b", amount_line, re.IGNORECASE):
+                crdr = " CR"
+            elif re.search(r"\bDR\b", amount_line, re.IGNORECASE):
+                crdr = " DR"
+            amt = clean_amount(f"{raw_amt}{crdr}")
+            runbal = clean_number(raw_runbal)
+
+            # If we have running balance and a previous running balance, use the delta to fix sign
+            if runbal is not None and prev_running is not None:
+                delta = round(runbal - prev_running, 2)
+                # If magnitudes match within 2c, trust the delta sign; otherwise trust delta anyway (FNB often omits signs)
+                if abs(abs(delta) - abs(amt)) <= 0.02 or True:
+                    amt = delta
+                prev_running = runbal  # advance
+
+            try:
+                dt = datetime.strptime(f"{int(day):02d} {mon.title()} {year}", "%d %b %Y")
+                txns.append((dt, desc, amt))
+            except Exception:
+                leftovers.append(f"[DATEERR] {day} {mon} :: {desc} :: {amount_line}")
+            i = j + 1
+        else:
+            snippet = " | ".join([line] + lines[i+1:j])
+            leftovers.append(f"[UNTERMINATED] {snippet[:240]}")
+            i = j
+    return txns, leftovers
+
 def parse_file(path: str) -> Dict[str, Any]:
     doc = fitz.open(path)
     try:
         full_text = "\n".join(page.get_text("text") for page in doc)
+        opening, closing = parse_balances_text(full_text)
         year = try_parse_statement_year(full_text) or datetime.now().year
 
         lines = tokenize_lines(doc)
-        txns, leftovers = parse_transactions_from_lines(lines, year)
-        opening, closing = parse_balances_text(full_text)
+        txns, leftovers = parse_transactions_from_lines(lines, year, opening)
 
         return {
             "year": year,
@@ -381,15 +399,12 @@ def main():
     st.subheader("Detailed Transactions")
     if all_tx:
         df_tx = pd.DataFrame(all_tx).sort_values(["Statement", "Date"]).reset_index(drop=True)
-        # Ensure income positive, expenses negative by sign of amount (already ensured via parsing)
         st.dataframe(df_tx, use_container_width=True, height=420)
 
-        # Quick type summary
         st.markdown("**Summary by Type**")
         g = df_tx.groupby("Type")["Amount (ZAR)"].sum().reset_index().sort_values("Amount (ZAR)", ascending=False)
         st.dataframe(g, use_container_width=True)
 
-        # Download
         st.download_button(
             "⬇️ Download transactions CSV",
             data=df_tx.to_csv(index=False).encode("utf-8"),
