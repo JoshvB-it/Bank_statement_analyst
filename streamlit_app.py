@@ -1,4 +1,5 @@
-# FNB Statement Analyzer — word/row parser + running-balance deltas
+# streamlit_app.py
+# FNB Statement Analyzer — row-stitching parser + running-balance deltas
 # Requires: streamlit==1.30.0, PyMuPDF==1.25.5, pandas==2.2.2
 
 import os, re, tempfile
@@ -11,9 +12,9 @@ import pandas as pd
 import streamlit as st
 
 st.set_page_config(page_title="FNB Statement Analyzer", layout="wide")
-PARSER_VERSION = "2025-08-09-r5"
+PARSER_VERSION = "2025-08-09-r6"
 
-# Password (env/Secrets) — default for local
+# ---- Auth (supports ?pw=...) ----
 try:
     SECRET_PW = st.secrets.get("APP_PASSWORD") if hasattr(st, "secrets") else None
 except Exception:
@@ -23,7 +24,6 @@ DEFAULT_PASSWORD = os.getenv("APP_PASSWORD") or SECRET_PW or "changeme"
 st.title("📑 FNB Bank Statement Analyzer")
 st.caption(f"Parser version: {PARSER_VERSION}")
 
-# --- Simple auth (supports ?pw=...) ---
 try:
     qparams = st.experimental_get_query_params()
 except Exception:
@@ -40,29 +40,12 @@ if not st.session_state.pw_ok:
             st.error("Incorrect password")
     st.stop()
 
-# ---------------- Helpers ----------------
+# ---- Helpers / patterns ----
 MONTHS_3 = "jan feb mar apr may jun jul aug sep oct nov dec".split()
-NUM_CORE = r"\d{1,3}(?:,\d{3})*\.\d{2}"  # force cents to avoid grabbing card refs etc.
-NUM_TOKEN_ATT = re.compile(rf"^({NUM_CORE})([Cc][Rr]|[Dd][Rr])?$")  # e.g. 10,878.94  | 10,878.94Cr
-
-HEADER_NOISE = [re.compile(p, re.I) for p in [
-    r"^page\s+\d+\s+of\s+\d+$",
-    r"^fnb\b.*",
-    r"^first national bank\b.*",
-    r"^branch\b.*",
-    r"^account\b.*",
-    r"^statement\b.*",
-    r"^transactions in rand.*$",
-    r"^date\s+description\s+amount\s+balance.*$",
-    r"^delivery method.*$",
-    r"^bank charges.*$",
-    r"^interest rate.*$",
-    r"^service fees.*$",
-    r"^total vat.*$",
-    r"^inclusive of vat.*$",
-    r"^closing balance.*$",
-    r"^opening balance.*$",
-]]
+NUM_CORE = r"\d{1,3}(?:,\d{3})*\.\d{2}"   # force cents to dodge card refs like 431835*1425
+NUM_TOKEN = re.compile(rf"^{NUM_CORE}$")
+CRDR = re.compile(r"^[Cc][Rr]$|^[Dd][Rr]$")
+DATE_ROW = re.compile(r"^\d{1,2}\s+[A-Za-z]{3}\b", re.I)
 
 def try_parse_statement_year(text: str) -> Optional[int]:
     m = re.search(r"Statement\s*Date\s*:\s*\d{1,2}\s+[A-Za-z]{3,}\s+(\d{4})", text, re.I)
@@ -86,13 +69,121 @@ def parse_balances_text(text: str) -> Tuple[Optional[float], Optional[float]]:
         return -abs(v) if tag == "DR" else abs(v)
     return one(rx_open), one(rx_close)
 
+# ---- Word/row utilities ----
+def build_rows(doc: fitz.Document):
+    """Return visual rows as token lists (y-rounded lines, in page order)."""
+    rows = []
+    for page in doc:
+        words = page.get_text("words")
+        if not words:
+            continue
+        df = pd.DataFrame(words, columns=["x0","y0","x1","y1","text","block","line","word"])
+        if df.empty:
+            continue
+        df["y_round"] = df["y0"].round(1)
+        for y, g in df.groupby("y_round"):
+            g = g.sort_values("x0")
+            rows.append({
+                "text": " ".join(g["text"].tolist()).strip(),
+                "tokens": g["text"].tolist(),
+                "x": g["x0"].tolist()
+            })
+    return rows
+
+def parse_transactions_rows(doc: fitz.Document, year_hint: Optional[int], opening: Optional[float]):
+    """Stitch wrapped rows: from each date row, scan forward until amount & balance appear."""
+    rows = build_rows(doc)
+    tx = []
+    prev_running = opening
+    i, n = 0, len(rows)
+
+    while i < n:
+        r = rows[i]
+        if not DATE_ROW.match(r["text"]):
+            i += 1
+            continue
+
+        # gather description tokens until we encounter the first numeric-with-cents
+        desc_tokens = r["tokens"][:]   # start with tokens on the date row
+        amount_tok = None
+        runbal_tok = None
+
+        j = i
+        while True:
+            # find first numeric in current row if needed
+            if amount_tok is None:
+                for t in rows[j]["tokens"]:
+                    if NUM_TOKEN.match(t):
+                        amount_tok = t
+                        break
+            else:
+                # keep track of the last numeric before the next date -> running balance
+                for t in rows[j]["tokens"][::-1]:
+                    if NUM_TOKEN.match(t):
+                        runbal_tok = t
+                        break
+
+            # extend desc with non-numeric / non-CRDR tokens
+            if j != i:  # include tokens from intermediate lines
+                desc_tokens += [t for t in rows[j]["tokens"] if not (NUM_TOKEN.match(t) or CRDR.match(t))]
+
+            # stop when next visual row starts with a date or we’ve scanned past end
+            if (j + 1 >= n) or DATE_ROW.match(rows[j + 1]["text"]):
+                break
+            j += 1
+
+        # Fallbacks: if amount/balance still not seen, try date row tokens
+        if amount_tok is None:
+            for t in r["tokens"]:
+                if NUM_TOKEN.match(t):
+                    amount_tok = t; break
+        if runbal_tok is None:
+            for t in r["tokens"][::-1]:
+                if NUM_TOKEN.match(t):
+                    runbal_tok = t; break
+
+        # Convert tokens to values
+        amount_val = float(amount_tok.replace(",", "")) if amount_tok else 0.0
+        runbal_val = float(runbal_tok.replace(",", "")) if runbal_tok else None
+
+        # Prefer running-balance delta for the true signed amount
+        amt = amount_val
+        if (runbal_val is not None) and (prev_running is not None):
+            amt = round(runbal_val - prev_running, 2)
+            prev_running = runbal_val
+
+        # Build clean description: tokens from after the date up to before the first numeric we encountered
+        # (remove numeric and CR/DR tokens that we appended from wrapped lines)
+        clean_desc = []
+        started = False
+        for t in desc_tokens:
+            if not started:
+                started = True  # first token is day, skip only for spacing; we keep rest
+                continue
+            if NUM_TOKEN.match(t) or CRDR.match(t):
+                continue
+            clean_desc.append(t)
+        desc = " ".join(clean_desc).strip()
+
+        # Parse date from the first two tokens in the original row text
+        m = re.match(r"^(\d{1,2})\s+([A-Za-z]{3})\b", r["text"])
+        mon = m.group(2).title(); day = int(m.group(1))
+        year = year_hint or datetime.now().year
+        dt = datetime.strptime(f"{day:02d} {mon} {year}", "%d %b %Y")
+
+        tx.append((dt, desc, amt))
+        i = j + 1  # jump to the next date block
+
+    return tx
+
+# ---- Classification ----
+TRANSFER_KEYWORDS = [
+    "transfer","inter-account","inter account","internal tf","bankapp transfer",
+    "bank app transfer","e-wallet","ewallet","eft","rtgs","instant payment",
+    "pay and clear","recon","faster payment","own account","to savings","from savings",
+    "global payment"
+]
 def classify_type(description: str, amount: float) -> str:
-    TRANSFER_KEYWORDS = [
-        "transfer","inter-account","inter account","internal tf","bankapp transfer",
-        "bank app transfer","e-wallet","ewallet","eft","rtgs","instant payment",
-        "pay and clear","recon","faster payment","own account","to savings","from savings",
-        "global payment"
-    ]
     d = description.lower()
     is_transfer = any(k in d for k in TRANSFER_KEYWORDS)
     if amount > 0:
@@ -102,109 +193,24 @@ def classify_type(description: str, amount: float) -> str:
     else:
         return "Zero / Reversal"
 
-# ---------------- Core: word/row parser ----------------
-def iter_rows_words(doc: fitz.Document):
-    """Yield row dicts from PyMuPDF word coordinates (one dict per printed row)."""
-    for pageno, page in enumerate(doc):
-        # exclude obvious header/footer noise by line prefix
-        words = page.get_text("words")  # (x0,y0,x1,y1,text, block, line, word)
-        if not words:
-            continue
-        df = pd.DataFrame(words, columns=["x0","y0","x1","y1","text","block","line","word"])
-        if df.empty:
-            continue
-        # Drop lines that are clearly headings
-        df["keep"] = True
-        mask_drop = pd.Series(False, index=df.index)
-        for rx in HEADER_NOISE:
-            mask_drop |= df["text"].str.match(rx)
-        df = df.loc[~mask_drop].copy()
-
-        df["y_round"] = df["y0"].round(1)
-        for y, g in df.groupby("y_round"):
-            g = g.sort_values("x0")
-            tokens = g["text"].tolist()
-            row_text = " ".join(tokens).strip()
-            yield {"page": pageno, "y": float(y), "tokens": tokens, "x": g["x0"].tolist(), "text": row_text}
-
-def parse_transactions_words(doc: fitz.Document, year_hint: Optional[int], opening: Optional[float]):
-    """Return list[(date, desc, signed_amount)] using row-aware parsing."""
-    tx = []
-    prev_running = opening
-    DATE_ROW = re.compile(r"^\d{1,2}\s+[A-Za-z]{3}\b")
-
-    for row in iter_rows_words(doc):
-        text = row["text"]
-        if not DATE_ROW.match(text):
-            continue
-
-        # Find numeric-with-cents tokens in order (accept attached Cr/Dr)
-        nums = []
-        for t, x in zip(row["tokens"], row["x"]):
-            m = NUM_TOKEN_ATT.match(t)
-            if m:
-                val = float(m.group(1).replace(",", ""))
-                tag = (m.group(2) or "").upper()
-                nums.append((x, val, tag))
-        if not nums:
-            continue
-
-        nums.sort(key=lambda r: r[0])
-        # amount = first numeric; running balance = last numeric (if 2+)
-        a_val, a_tag = nums[0][1], nums[0][2]
-        amount_raw = -a_val if a_tag == "DR" else a_val
-        runbal = None
-        if len(nums) > 1:
-            rb_val, rb_tag = nums[-1][1], nums[-1][2]
-            runbal = -rb_val if rb_tag == "DR" else rb_val
-
-        # Derive true signed amount from running-balance delta (preferred)
-        amount = amount_raw
-        if (runbal is not None) and (prev_running is not None):
-            amount = round(runbal - prev_running, 2)
-            prev_running = runbal
-
-        # Build date + description (strip trailing amount/balance tokens from desc)
-        mdate = re.match(r"^(\d{1,2})\s+([A-Za-z]{3})\b(.*)$", text)
-        if not mdate:
-            continue
-        d, mon, rest = mdate.groups()
-        year = year_hint or datetime.now().year
-        dt = datetime.strptime(f"{int(d):02d} {mon.title()} {year}", "%d %b %Y")
-
-        # remove the trailing numeric tokens from desc
-        toks = row["tokens"]
-        # find index of the first numeric token -> cut desc before it
-        first_num_idx = None
-        for idx, t in enumerate(toks):
-            if NUM_TOKEN_ATT.match(t):
-                first_num_idx = idx
-                break
-        desc_tokens = toks[1:first_num_idx] if first_num_idx is not None else toks[1:]
-        desc = " ".join(desc_tokens).strip()
-
-        tx.append((dt, desc, amount))
-    return tx
-
 def parse_file(path: str) -> Dict[str, Any]:
     doc = fitz.open(path)
     try:
-        text = "\n".join(pg.get_text("text") for pg in doc)
-        opening, closing = parse_balances_text(text)
-        year = try_parse_statement_year(text) or datetime.now().year
-        txns = parse_transactions_words(doc, year, opening)
-        leftovers: List[str] = []  # row parser is strict; we don’t need leftovers for now
+        full_text = "\n".join(pg.get_text("text") for pg in doc)
+        opening, closing = parse_balances_text(full_text)
+        year = try_parse_statement_year(full_text) or datetime.now().year
+        txns = parse_transactions_rows(doc, year, opening)
         return {
             "year": year,
             "transactions": txns,
             "opening": opening,
             "closing": closing,
-            "leftovers": leftovers,
+            "leftovers": [],  # row-stitching avoids most leftovers
         }
     finally:
         doc.close()
 
-# ---------------- App ----------------
+# ---- App ----
 def main():
     st.sidebar.subheader("Options")
     tol = st.sidebar.number_input("Reconciliation tolerance (ZAR)", value=0.01, step=0.01, min_value=0.00, format="%.2f")
@@ -229,11 +235,11 @@ def main():
         txns = parsed["transactions"]
         opening, closing = parsed["opening"], parsed["closing"]
 
-        # rows for detail + classification
         for dt, desc, amt in txns:
             all_tx.append({
                 "Statement": Path(file.name).stem,
-                "Date": dt, "Description": desc,
+                "Date": dt,
+                "Description": desc,
                 "Amount (ZAR)": round(amt, 2),
                 "Type": classify_type(desc, amt),
             })
@@ -251,6 +257,15 @@ def main():
             "Difference (ZAR)": None if diff is None else round(diff, 2),
             "Parsed Tx Count": len(txns),
         })
+
+        with st.expander(f"🔎 Diagnostics — {Path(file.name).stem}", expanded=False):
+            c1, c2 = st.columns(2)
+            with c1:
+                st.write("**Detected year:**", parsed["year"])
+                st.write("**Opening / Closing (raw parsed):**", opening, closing)
+                st.write("**Transactions parsed:**", len(txns))
+            with c2:
+                st.write("Row-stitching parser enabled")
 
     # Detailed transactions
     st.subheader("Detailed Transactions")
