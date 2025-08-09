@@ -1,5 +1,5 @@
 # streamlit_app.py
-# FNB Bank Statement Analyzer — robust running-balance sign + split-line rows
+# FNB Bank Statement Analyzer — row-accurate parser using running-balance deltas
 # Requires: streamlit==1.30.0, PyMuPDF==1.25.5, pandas==2.2.2, altair==5.2.0
 
 import os
@@ -15,7 +15,7 @@ import streamlit as st
 
 # ---------------- UI / Meta ----------------
 st.set_page_config(page_title="FNB Statement Analyzer", layout="wide")
-PARSER_VERSION = "2025-08-09-r3"
+PARSER_VERSION = "2025-08-09-r4"
 
 # Password from Secrets / env, fallback for local
 try:
@@ -41,7 +41,7 @@ if "pw_ok" not in st.session_state:
     st.session_state.pw_ok = (qpw == DEFAULT_PASSWORD)
 
 if not st.session_state.pw_ok:
-    st.info("Enter the password to proceed. (Tip: you can append `?pw=...` to the URL)")
+    st.info("Enter the password to proceed. (Tip: append `?pw=...` to the URL)")
     pwd = st.text_input("Password", value=qpw or "", type="password")
     if st.button("Unlock"):
         st.session_state.pw_ok = (pwd == DEFAULT_PASSWORD)
@@ -49,279 +49,59 @@ if not st.session_state.pw_ok:
             st.error("Incorrect password")
     st.stop()
 
-# ---------------- Helpers ----------------
+# ---------------- Patterns & helpers ----------------
 MONTHS_3 = "jan feb mar apr may jun jul aug sep oct nov dec".split()
+NUM = r"\d{1,3}(?:,\d{3})*\.\d{2}"  # enforce cents to avoid grabbing "431835*1425" etc.
 
-HEADER_NOISE_PATTERNS = [
+DATE_RE = re.compile(r"^\s*(\d{1,2})\s+([A-Za-z]{3})\b(.*)$", re.I)
+NUM_WITH_TAG = re.compile(rf"^\s*(?:[Rr]\s*)?({NUM})\s*([Cc][Rr]|[Dd][Rr])?\s*$")  # matches "10,878.94", "10,878.94Cr", "10,878.94 Dr"
+
+HEADER_NOISE = [re.compile(p, re.I) for p in [
     r"^page\s+\d+\s+of\s+\d+$",
     r"^fnb\b.*",
     r"^first national bank\b.*",
     r"^branch\b.*",
     r"^account\b.*",
     r"^statement\b.*",
-    r"^customer\b.*",
-    r"^contact\b.*",
-    r"^vat\b.*",
-    r"^registered\b.*",
-    r"^www\.",
-    r"^tel\b.*",
     r"^transactions in rand.*$",
-    r"^delivery method.*$",
-    r"^universal branch code.*$",
-    r"^lost cards.*$",
-    r"^account enquiries.*$",
-    r"^fraud.*$",
-    r"^interest rate.*$",
-    r"^bank charges.*$",
-    r"^statement balances.*$",
-    r"^inclusive of vat.*$",
-    r"^total vat.*$",
-    r"^service fees.*$",
-    r"^cash (?:deposit|handling) fees.*$",
-    r"^other fees.*$",
-    r"^credit rate.*$",
-    r"^debit rate.*$",
-    r"^facility limit.*$",
     r"^date\s+description\s+amount\s+balance.*$",
-    r"^accrued$",
-    r"^bank$",
-    r"^charges$",
-]
-HEADER_NOISE_RE = [re.compile(pat, re.IGNORECASE) for pat in HEADER_NOISE_PATTERNS]
+    r"^delivery method.*$",
+    r"^bank charges.*$",
+    r"^interest rate.*$",
+    r"^service fees.*$",
+    r"^total vat.*$",
+    r"^inclusive of vat.*$",
+    r"^closing balance.*$",
+    r"^opening balance.*$",
+]]
 
-def is_noise(line: str) -> bool:
-    s = line.strip()
-    if not s:
-        return True
-    for rx in HEADER_NOISE_RE:
-        if rx.match(s):
-            return True
-    return False
-
-def clean_amount(raw: str) -> float:
-    """
-    Accepts: '1,234.56', 'R 1,234.56', '(1,234.56)', '-1,234.56',
-             'CR 1,234.56', '1,234.56 DR', '1,234.56'
-    Returns signed float; if no sign cue, value is positive.
-    """
-    s = raw.strip()
-    cr = bool(re.search(r"\bCR\b", s, re.IGNORECASE))
-    dr = bool(re.search(r"\bDR\b", s, re.IGNORECASE))
-    s = re.sub(r"\b(CR|DR)\b", "", s, flags=re.IGNORECASE)
-    s = re.sub(r"[Rr]\s*", "", s).strip()
-    nums = re.findall(r"\(?-?\d{1,3}(?:,\d{3})*(?:\.\d{2})?\)?", s)
-    if not nums:
-        raise ValueError(f"No numeric token in: {raw!r}")
-    s = nums[0]
-    neg = False
-    if s.startswith("(") and s.endswith(")"):
-        neg = True
-        s = s[1:-1]
-    if s.startswith("-"):
-        neg = True
-        s = s[1:]
-    s = s.replace(",", "")
-    val = float(s)
-    if cr:
-        val = abs(val)
-    elif dr or neg:
-        val = -abs(val)
-    return val
-
-def clean_number(raw: Optional[str]) -> Optional[float]:
-    if not raw:
-        return None
-    s = raw.strip()
-    s = re.sub(r"[Rr]\s*", "", s)
-    s = s.replace(",", "")
-    if not s:
-        return None
-    if s.startswith("(") and s.endswith(")"):
-        s = "-" + s[1:-1]
-    try:
-        return float(s)
-    except Exception:
-        return None
-
-def try_parse_statement_year(text: str) -> Optional[int]:
-    m = re.search(r"Statement\s*Date\s*:\s*\d{1,2}\s+[A-Za-z]{3,}\s+(\d{4})", text, re.IGNORECASE)
-    if m:
-        return int(m.group(1))
-    m = re.search(r"\b(?:Period|From)\b.*?\d{1,2}\s+[A-Za-z]{3,}\s+(\d{4}).*?\bto\b.*?(\d{4})", text, re.IGNORECASE | re.S)
-    if m:
-        return int(m.group(2))
-    m = re.search(r"\bas\s+at\s+\d{1,2}\s+[A-Za-z]{3,}\s+(\d{4})", text, re.IGNORECASE)
-    if m:
-        return int(m.group(1))
-    return None
-
-def tokenize_lines(doc: fitz.Document) -> List[str]:
-    lines: List[str] = []
-    for page in doc:
-        for ln in page.get_text("text").splitlines():
+def filter_lines(doc: fitz.Document) -> List[str]:
+    out = []
+    for pg in doc:
+        for ln in pg.get_text("text").splitlines():
             s = ln.strip()
-            if is_noise(s):
+            if not s:
                 continue
-            lines.append(s)
-    # collapse multiple blanks
-    out, blank = [], False
-    for s in lines:
-        if not s:
-            if not blank:
-                out.append(s)
-            blank = True
-        else:
-            out.append(s); blank = False
+            if any(rx.match(s) for rx in HEADER_NOISE):
+                continue
+            out.append(s)
     return out
 
-# ---------------- Parsers ----------------
-DATE_START_RE = re.compile(r"^\s*(\d{1,2})\s+([A-Za-z]{3})\b(.*)$", re.IGNORECASE)
-
-# Combined amount+balance on one line (rare on these PDFs but keep it)
-AMOUNT_AND_BALANCE_RE = re.compile(
-    r"""
-    ^
-    (?:.*?(?:CR|DR)\s*)?                 # optional leading CR/DR
-    (?:.*?[Rr]\s*)?                      # optional 'R'
-    (\(?-?\d{1,3}(?:,\d{3})*(?:\.\d{2})?\)?)      # (1) amount
-    (?:\s*(?:CR|DR))?                    # optional CR/DR after amount
-    (?:\s+                               # optional trailing running balance
-       (\(?-?\d{1,3}(?:,\d{3})*(?:\.\d{2})?\)?)   # (2) running balance
-       (?:\s*(?:CR|DR))?                 # optional CR/DR after balance
-       \s*
-    )?
-    $
-    """,
-    re.IGNORECASE | re.VERBOSE,
-)
-
-# Amount or balance when they appear alone on a line
-AMOUNT_ONLY_RE = re.compile(r"^\s*(?:[Rr]\s*)?(\(?-?\d{1,3}(?:,\d{3})*(?:\.\d{2})?\)?)(?:\s*(?:CR|DR))?\s*$", re.IGNORECASE)
-BALANCE_ONLY_RE = AMOUNT_ONLY_RE
-
-def parse_transactions_from_lines(
-    lines: List[str], year: int, opening_balance: Optional[float]
-) -> Tuple[List[Tuple[datetime, str, float, Optional[float]]], List[str]]:
-    txns: List[Tuple[datetime, str, float, Optional[float]]] = []
-    leftovers: List[str] = []
-    prev_running = opening_balance
-
-    i, n = 0, len(lines)
-    while i < n:
-        line = lines[i].strip()
-        m_date = DATE_START_RE.match(line)
-        if not m_date:
-            i += 1
-            continue
-
-        day, mon, rest = m_date.groups()
-        mon = mon.strip()[:3].lower()
-        if mon not in MONTHS_3:
-            i += 1
-            continue
-
-        desc_parts = []
-        if rest:
-            desc_parts.append(rest.strip())
-
-        j = i + 1
-        amount = None
-        runbal = None
-        found = False
-        while j < n:
-            cand = lines[j].strip()
-            if DATE_START_RE.match(cand):
-                break
-            # Combined line (amount & running balance together)
-            m_comb = AMOUNT_AND_BALANCE_RE.match(cand)
-            if m_comb and (m_comb.group(1) is not None) and (m_comb.group(2) is not None):
-                amount = clean_amount(m_comb.group(1))
-                runbal = clean_number(m_comb.group(2))
-                found = True
-                j += 1
-                break
-            # Amount-only line (balance likely on the next line)
-            m_amt = AMOUNT_ONLY_RE.match(cand)
-            if m_amt:
-                amount = clean_amount(m_amt.group(1))
-                # Look ahead for balance
-                if j + 1 < n:
-                    look = lines[j+1].strip()
-                    m_bal = BALANCE_ONLY_RE.match(look)
-                    if m_bal:
-                        runbal = clean_number(m_bal.group(1))
-                        j += 2
-                        found = True
-                        break
-                j += 1
-                found = True
-                break
-            # Otherwise keep building the description
-            if cand:
-                desc_parts.append(cand)
-            j += 1
-
-        if found and amount is not None:
-            # Prefer the running-balance delta to determine the true signed amount
-            amt = amount
-            if runbal is not None and prev_running is not None:
-                delta = round(runbal - prev_running, 2)
-                amt = delta
-                prev_running = runbal
-
-            desc = " ".join(" ".join(desc_parts).split())
-            try:
-                dt = datetime.strptime(f"{int(day):02d} {mon.title()} {year}", "%d %b %Y")
-                txns.append((dt, desc, amt, runbal))
-            except Exception:
-                leftovers.append(f"[DATEERR] {day} {mon} :: {desc}")
-            i = j
-        else:
-            snippet = " | ".join([line] + lines[i+1:j])
-            leftovers.append(f"[UNTERMINATED] {snippet[:240]}")
-            i = j
-    return txns, leftovers
-
-BALANCE_RE = re.compile(
-    r"""
-    \b(Opening|Closing)\s*balance\b
-    (?:\s*(?:as\s*at)?\s*(?:\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{1,2}\s+[A-Za-z]{3,}\s+\d{4}))?
-    [\s:]*[Rr]?\s*
-    (\(?-?\d{1,3}(?:,\d{3})*(?:\.\d{2})?\)?)
-    (?:\s*(CR|DR))?
-    """,
-    re.IGNORECASE | re.VERBOSE,
-)
-ALT_CLOSING_RE = re.compile(
-    r"""
-    \b(?:Available|Current)\s*balance\b
-    (?:\s*(?:as\s*at)?\s*(?:\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{1,2}\s+[A-Za-z]{3,}\s+\d{4}))?
-    [\s:]*[Rr]?\s*
-    (\(?-?\d{1,3}(?:,\d{3})*(?:\.\d{2})?\)?)
-    (?:\s*(CR|DR))?
-    """,
-    re.IGNORECASE | re.VERBOSE,
-)
-
 def parse_balances_text(text: str) -> Tuple[Optional[float], Optional[float]]:
-    opening = None
-    closing = None
-    for m in BALANCE_RE.finditer(text):
-        label = m.group(1).lower()
-        num = m.group(2)
-        crdr = m.group(3) or ""
-        val = clean_amount(f"{num} {crdr}".strip())
-        if label == "opening":
-            opening = val
-        else:
-            closing = val
-    if closing is None:
-        m = ALT_CLOSING_RE.search(text)
-        if m:
-            num = m.group(1)
-            crdr = m.group(2) or ""
-            closing = clean_amount(f"{num} {crdr}".strip())
-    return opening, closing
+    num = r"\d{1,3}(?:,\d{3})*\.\d{2}"
+    rx_open = re.compile(rf"Opening\s*Balance.*?({num})\s*([Cc][Rr]|[Dd][Rr])?", re.S)
+    rx_close = re.compile(rf"Closing\s*Balance.*?({num})\s*([Cc][Rr]|[Dd][Rr])?", re.S)
+    def parse_one(rx):
+        m = rx.search(text)
+        if not m: return None
+        val = float(m.group(1).replace(",", ""))
+        tag = (m.group(2) or "CR").upper()
+        return -abs(val) if tag == "DR" else abs(val)
+    return parse_one(rx_open), parse_one(rx_close)
+
+def parse_year(text: str) -> int:
+    m = re.search(r"\b(20\d{2})\b", text)
+    return int(m.group(1)) if m else datetime.now().year
 
 # ---- Type Classification (Income / Expense / Transfer) ----
 TRANSFER_KEYWORDS = [
@@ -341,13 +121,82 @@ def classify_type(description: str, amount: float) -> str:
     else:
         return "Zero / Reversal"
 
+def parse_transactions_from_lines(lines: List[str], year: int, opening: Optional[float]):
+    txns: List[Tuple[datetime, str, float, Optional[float]]] = []
+    leftovers: List[str] = []
+    prev_running = opening
+
+    i, n = 0, len(lines)
+    while i < n:
+        s = lines[i].strip()
+        m = DATE_RE.match(s)
+        if not m:
+            i += 1
+            continue
+
+        day, mon, rest = m.groups()
+        mon3 = mon[:3].title()
+        desc_parts = [rest.strip()] if rest else []
+
+        # First numeric-with-cents after the date = AMOUNT (with optional Cr/Dr)
+        j = i + 1
+        amount = None
+        runbal = None
+
+        while j < n:
+            t = lines[j].strip()
+            if DATE_RE.match(t):
+                break
+            mnum = NUM_WITH_TAG.match(t)
+            if mnum:
+                a_val = float(mnum.group(1).replace(",", ""))
+                a_tag = (mnum.group(2) or "").upper()
+                amount = -a_val if a_tag == "DR" else a_val
+                j += 1
+                break
+            else:
+                if t:
+                    desc_parts.append(t)
+                j += 1
+
+        # Next numeric-with-cents line (if present) = RUNNING BALANCE (with optional Cr/Dr)
+        if amount is not None and j < n:
+            t2 = lines[j].strip()
+            mnum2 = NUM_WITH_TAG.match(t2)
+            if mnum2:
+                rb_val = float(mnum2.group(1).replace(",", ""))
+                rb_tag = (mnum2.group(2) or "").upper()
+                runbal = -rb_val if rb_tag == "DR" else rb_val
+                j += 1
+
+        if amount is None:
+            leftovers.append(f"no amount after {s}")
+            i = j
+            continue
+
+        # Prefer running-balance delta to determine the true signed amount (handles Amount without signs)
+        amt = amount
+        if (runbal is not None) and (prev_running is not None):
+            amt = round(runbal - prev_running, 2)
+            prev_running = runbal
+
+        try:
+            dt = datetime.strptime(f"{int(day):02d} {mon3} {year}", "%d %b %Y")
+        except Exception:
+            dt = None
+        desc = " ".join(" ".join(desc_parts).split())
+        txns.append((dt, desc, amt, runbal))
+        i = j
+
+    return txns, leftovers
+
 def parse_file(path: str) -> Dict[str, Any]:
     doc = fitz.open(path)
     try:
-        full_text = "\n".join(page.get_text("text") for page in doc)
+        full_text = "\n".join(pg.get_text("text") for pg in doc)
         opening, closing = parse_balances_text(full_text)
-        year = try_parse_statement_year(full_text) or datetime.now().year
-        lines = tokenize_lines(doc)
+        year = parse_year(full_text)
+        lines = filter_lines(doc)
         txns, leftovers = parse_transactions_from_lines(lines, year, opening)
         return {
             "year": year,
